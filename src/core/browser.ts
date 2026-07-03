@@ -1,0 +1,347 @@
+/**
+ * ClayCode 网页AI浏览器桥接模块
+ * 内置Puppeteer浏览器控制内核，单例托管Chrome实例
+ * 自动清理锁文件，复用用户登录态，内存级输出流清洗
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { Browser, Page, Protocol } from 'puppeteer-core';
+import { GlobalConfig, BrowserStatus, BrowserInfo, ErrorCode } from '../types';
+import { logger, ensureDir, resolveHome, findChromePath, cleanStreamOutput, detectCaptcha } from '../utils';
+import { SecurityManager } from './security';
+
+/** 最大浏览器重启次数 */
+const MAX_RESTART_COUNT = 3;
+
+/** 浏览器重启延迟(ms) */
+const RESTART_DELAY = 2000;
+
+export class BrowserBridge {
+  private config: GlobalConfig;
+  private browser: Browser | null = null;
+  private page: Page | null = null;
+  private info: BrowserInfo = {
+    status: 'idle',
+    restartCount: 0,
+  };
+  private security: SecurityManager;
+
+  constructor(config: GlobalConfig) {
+    this.config = config;
+    this.security = new SecurityManager(process.cwd());
+  }
+
+  /** 获取浏览器状态信息 */
+  getInfo(): BrowserInfo {
+    return { ...this.info };
+  }
+
+  /** 启动浏览器实例（单例） */
+  async launch(): Promise<Browser> {
+    if (this.browser && this.info.status === 'running') {
+      logger.info('[BrowserBridge] 浏览器实例已在运行，复用现有实例');
+      return this.browser;
+    }
+
+    this.info.status = 'launching';
+    logger.info('[BrowserBridge] 正在启动浏览器实例...');
+
+    try {
+      // 1. 清理锁文件
+      await this.cleanLockFiles();
+
+      // 2. 确保浏览器缓存目录存在
+      const dataDir = resolveHome(this.config.browserDataPath);
+      ensureDir(dataDir);
+
+      // 3. 查找Chrome可执行路径
+      const chromePath = findChromePath();
+      if (!chromePath) {
+        throw new Error('未找到Chrome浏览器，请先安装Google Chrome');
+      }
+      logger.info(`[BrowserBridge] Chrome路径: ${chromePath}`);
+
+      // 4. 启动Puppeteer
+      const launchOptions: Record<string, any> = {
+        executablePath: chromePath,
+        headless: this.config.browserHeadless ? true : false,
+        userDataDir: dataDir,
+        defaultViewport: { width: 1280, height: 800 },
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--disable-gpu',
+          '--window-size=1280,800',
+        ],
+      };
+
+      // 动态导入 puppeteer-core
+      const puppeteer = await import('puppeteer-core');
+      this.browser = await puppeteer.default.launch(launchOptions);
+
+      // 5. 监听断开事件
+      this.browser.on('disconnected', () => {
+        logger.warn('[BrowserBridge] 浏览器连接断开');
+        this.info.status = 'crashed';
+        this.attemptRestart();
+      });
+
+      this.info.status = 'running';
+      this.info.lastStartedAt = Date.now();
+      this.info.lastError = undefined;
+
+      logger.info('[BrowserBridge] 浏览器启动成功');
+      return this.browser;
+
+    } catch (err) {
+      this.info.status = 'crashed';
+      this.info.lastError = (err as Error).message;
+      logger.error(`[BrowserBridge] 浏览器启动失败: ${(err as Error).message}`);
+      throw err;
+    }
+  }
+
+  /** 获取或创建Page实例 */
+  async getPage(): Promise<Page> {
+    if (!this.browser || this.info.status !== 'running') {
+      await this.launch();
+    }
+    if (!this.page || this.page.isClosed()) {
+      const pages = await this.browser!.pages();
+      this.page = pages.length > 0 ? pages[0] : await this.browser!.newPage();
+    }
+    return this.page;
+  }
+
+  /** 导航到指定URL */
+  async navigateTo(url: string): Promise<Page> {
+    const page = await this.getPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.requestTimeout });
+    return page;
+  }
+
+  /** 在页面中输入文本并发送 */
+  async typeAndSend(inputSelector: string, sendButtonSelector: string, text: string): Promise<void> {
+    const page = await this.getPage();
+
+    // 等待输入框可用
+    await page.waitForSelector(inputSelector, { timeout: 10000 });
+    // 清空并输入
+    const inputEl = await page.$(inputSelector);
+    if (inputEl) {
+      await inputEl.click({ clickCount: 3 }); // 全选
+      await page.keyboard.press('Backspace');
+      await page.type(inputSelector, text, { delay: 50 });
+    }
+
+    // 点击发送按钮
+    await page.waitForSelector(sendButtonSelector, { timeout: 5000 });
+    await page.click(sendButtonSelector);
+  }
+
+  /** 等待AI回复并提取文本 */
+  async waitForResponse(responseSelector: string, timeout?: number): Promise<string> {
+    const page = await this.getPage();
+    const waitTime = timeout ?? this.config.requestTimeout;
+
+    try {
+      // 等待回复容器出现
+      await page.waitForSelector(responseSelector, { timeout: waitTime });
+
+      // 等待回复完成（内容不再变化）
+      let lastText = '';
+      let stableCount = 0;
+      const stableThreshold = 3; // 连续3次内容不变视为完成
+
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const currentText = await page.$eval(responseSelector, (el: any) => el.textContent || '');
+        const cleaned = cleanStreamOutput(currentText);
+
+        if (cleaned === lastText && cleaned.length > 0) {
+          stableCount++;
+          if (stableCount >= stableThreshold) break;
+        } else {
+          stableCount = 0;
+          lastText = cleaned;
+        }
+      }
+
+      // 提取最终回复
+      const finalText = await page.$eval(responseSelector, (el: any) => el.textContent || '');
+      const cleanedResponse = cleanStreamOutput(finalText);
+
+      // 检测人机验证
+      if (detectCaptcha(cleanedResponse)) {
+        throw Object.assign(new Error('网页AI需要人机验证'), { code: ErrorCode.HUMAN_VERIFICATION });
+      }
+
+      return cleanedResponse;
+
+    } catch (err) {
+      if ((err as any).code === ErrorCode.HUMAN_VERIFICATION) throw err;
+      logger.error(`[BrowserBridge] 等待AI回复超时: ${(err as Error).message}`);
+      throw Object.assign(new Error('AI请求超时'), { code: ErrorCode.RESPONSE_TIMEOUT });
+    }
+  }
+
+  /** 关闭浏览器 */
+  async close(): Promise<void> {
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+      this.page = null;
+      this.info.status = 'idle';
+      logger.info('[BrowserBridge] 浏览器已关闭');
+    }
+  }
+
+  /** 清理浏览器锁文件 */
+  private async cleanLockFiles(): Promise<void> {
+    const dataDir = resolveHome(this.config.browserDataPath);
+    if (!fs.existsSync(dataDir)) return;
+
+    const lockFileNames = ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'lockfile'];
+    try {
+      const entries = fs.readdirSync(dataDir);
+      for (const entry of entries) {
+        if (lockFileNames.includes(entry) || entry.endsWith('.lock') || entry.endsWith('.incomplete')) {
+          const fullPath = path.join(dataDir, entry);
+          try {
+            fs.unlinkSync(fullPath);
+            logger.info(`[BrowserBridge] 已清理锁文件: ${entry}`);
+          } catch {
+            // 忽略删除失败
+          }
+        }
+      }
+    } catch {
+      // 忽略目录读取错误
+    }
+  }
+
+  /** 自动重启浏览器（公开方法，供引擎全链路异常恢复调用） */
+  async attemptRestart(): Promise<void> {
+    if (this.info.restartCount >= MAX_RESTART_COUNT) {
+      logger.error(`[BrowserBridge] 浏览器重启次数已达上限(${MAX_RESTART_COUNT})`);
+      this.info.status = 'crashed';
+      return;
+    }
+
+    this.info.status = 'restarting';
+    this.info.restartCount++;
+    logger.info(`[BrowserBridge] 正在重启浏览器 (第${this.info.restartCount}次)...`);
+
+    // 延迟重启
+    await new Promise((r) => setTimeout(r, RESTART_DELAY));
+
+    try {
+      // 先保存Cookie
+      await this.saveCookies();
+
+      // 清理旧实例
+      if (this.browser) {
+        try { await this.browser.close(); } catch { /* 忽略 */ }
+        this.browser = null;
+        this.page = null;
+      }
+
+      // 清理锁文件后重启
+      await this.cleanLockFiles();
+      await this.launch();
+
+      // 恢复Cookie
+      await this.loadCookies();
+
+      logger.info('[BrowserBridge] 浏览器重启成功');
+    } catch (err) {
+      logger.error(`[BrowserBridge] 浏览器重启失败: ${(err as Error).message}`);
+      this.info.status = 'crashed';
+    }
+  }
+
+  // ---- Cookie加密持久化 (3.2) ----
+
+  /** Cookie加密存储文件路径 */
+  private getCookieFilePath(): string {
+    const dataDir = resolveHome(this.config.browserDataPath);
+    ensureDir(dataDir);
+    return path.join(dataDir, 'cookies.enc');
+  }
+
+  /**
+   * 保存当前页面的Cookie到加密文件
+   * AES-256-CBC加密持久化，保留登录态
+   */
+  async saveCookies(): Promise<void> {
+    try {
+      if (!this.page) return;
+
+      const cookies = await this.page.cookies();
+      if (cookies.length === 0) {
+        logger.debug('[BrowserBridge] 无Cookie需要保存');
+        return;
+      }
+
+      const cookieJson = JSON.stringify(cookies);
+      const encrypted = this.security.encrypt(cookieJson);
+
+      const cookiePath = this.getCookieFilePath();
+      fs.writeFileSync(cookiePath, encrypted, 'utf-8');
+      logger.info(`[BrowserBridge] 已加密保存 ${cookies.length} 个Cookie`);
+    } catch (err) {
+      logger.warn(`[BrowserBridge] Cookie保存失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * 从加密文件加载Cookie到当前页面
+   * 解密后设置到浏览器，复用登录态
+   */
+  async loadCookies(): Promise<void> {
+    try {
+      const cookiePath = this.getCookieFilePath();
+      if (!fs.existsSync(cookiePath)) {
+        logger.debug('[BrowserBridge] 无Cookie缓存文件');
+        return;
+      }
+
+      const encrypted = fs.readFileSync(cookiePath, 'utf-8');
+      const decrypted = this.security.decrypt(encrypted);
+      const cookies: Protocol.Network.Cookie[] = JSON.parse(decrypted);
+
+      // 将Cookie转换为CookieParam格式（去除partitionKey等不兼容字段）
+      const cookieParams = cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path,
+        secure: c.secure,
+        httpOnly: c.httpOnly,
+        sameSite: c.sameSite as 'Strict' | 'Lax' | 'None' | undefined,
+        expires: c.expires,
+      }));
+
+      if (!this.page) {
+        const page = await this.getPage();
+        await page.setCookie(...cookieParams);
+      } else {
+        await this.page.setCookie(...cookieParams);
+      }
+
+      logger.info(`[BrowserBridge] 已加载 ${cookies.length} 个Cookie`);
+    } catch (err) {
+      logger.warn(`[BrowserBridge] Cookie加载失败: ${(err as Error).message}`);
+    }
+  }
+
+  /** 检查是否有加密Cookie缓存 */
+  hasCookieCache(): boolean {
+    const cookiePath = this.getCookieFilePath();
+    return fs.existsSync(cookiePath);
+  }
+}

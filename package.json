@@ -1,0 +1,42 @@
+{
+  "name": "claycode",
+  "version": "1.0.0",
+  "description": "ClayCode - 完全自研的一体化终端AI编码引擎，免API Key，内置浏览器桥接与本地执行引擎",
+  "main": "dist/core/index.js",
+  "bin": {
+    "clay": "dist/bin/clay.js"
+  },
+  "types": "dist/types/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bin/clay.js",
+    "dev": "ts-node src/bin/clay.ts",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "terminal",
+    "browser-bridge",
+    "no-api-key"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "glob": "^10.3.0",
+    "puppeteer-core": "^22.0.0"
+  }
+}
