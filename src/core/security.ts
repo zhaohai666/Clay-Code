@@ -90,8 +90,8 @@ export class SecurityManager {
   validatePath(filePath: string): { valid: boolean; absPath: string; reason?: string } {
     const absPath = normalizePath(path.resolve(filePath));
 
-    // 检查是否在项目根目录内
-    if (!absPath.startsWith(this.projectRoot)) {
+    // 检查是否在项目根目录内（Windows路径大小写不敏感）
+    if (!absPath.toLowerCase().startsWith(this.projectRoot.toLowerCase())) {
       return {
         valid: false,
         absPath,
@@ -99,8 +99,8 @@ export class SecurityManager {
       };
     }
 
-    // 检查路径遍历攻击
-    const resolved = path.resolve(absPath);
+    // 检查路径遍历攻击（规范化后比较，兼容Windows反斜杠）
+    const resolved = normalizePath(path.resolve(absPath));
     if (resolved !== absPath) {
       return {
         valid: false,
@@ -309,15 +309,16 @@ export class SecurityManager {
     }
 
     for (const tc of toolCalls) {
+      // 检查是否在截断范围内（文件操作超量时跳过，已在上方标记为invalid）
+      if (['read', 'edit', 'write'].includes(tc.tool)) {
+        const fileOpIndex = fileOps.indexOf(tc);
+        if (fileOpIndex >= this.maxBatchFiles) {
+          continue; // 已在上方标记为invalid，跳过避免重复添加
+        }
+      }
+
       const result = this.validateToolCall(tc);
       if (result.valid) {
-        // 检查是否在截断范围内
-        if (['read', 'edit', 'write'].includes(tc.tool)) {
-          const fileOpIndex = fileOps.indexOf(tc);
-          if (fileOpIndex >= this.maxBatchFiles) {
-            continue; // 已在上方标记为invalid
-          }
-        }
         valid.push(tc);
       } else {
         invalid.push({ tc, result });

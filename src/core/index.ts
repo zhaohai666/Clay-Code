@@ -90,7 +90,9 @@ export class ClayCodeEngine {
     this.pluginManager = new PluginManager(this.configManager.getPluginsDir());
 
     // 6. 监控指标采集器
-    this.metrics = new MetricsCollector();
+    this.metrics = new MetricsCollector({
+      httpPort: this.config.metricsPort,
+    });
 
     // 7. 初始化协议转换器
     this.protocol = new ProtocolConverter(this.config);
@@ -100,6 +102,7 @@ export class ClayCodeEngine {
       maxOutputLength: this.config.maxContextChunk,
       execWhiteList: this.config.execWhiteList,
       enableSandbox: this.config.enableSandbox,
+      enableDockerSandbox: this.config.enableDockerSandbox,
     });
 
     // 9. 初始化浏览器桥接
@@ -180,6 +183,11 @@ export class ClayCodeEngine {
     await this.pluginManager.loadAll();
     await this.pluginManager.setupAll();
     logger.info('[ClayCodeEngine] 插件已加载');
+
+    // 启动Prometheus HTTP端点（如果配置了端口）
+    if (this.config.metricsPort > 0) {
+      await this.metrics.startHttpServer();
+    }
 
     logger.info('[ClayCodeEngine] 初始化完成');
   }
@@ -541,7 +549,7 @@ export class ClayCodeEngine {
     await this.pluginManager.destroyAll();
     await this.browserBridge.close();
     this.cache.destroy();
-    this.metrics.destroy();
+    await this.metrics.destroy();
     logger.close();
   }
 

@@ -325,7 +325,7 @@ program
   .option('-n, --lines <n>', '显示行数', '50')
   .option('-f, --follow', '持续跟踪日志')
   .option('--level <level>', '过滤日志级别(debug/info/warn/error)')
-  .action((opts: { lines: string; follow?: boolean; level?: string }) => {
+  .action(async (opts: { lines: string; follow?: boolean; level?: string }) => {
     const cm = new ConfigManager();
     const logDir = cm.getLogDir();
     // 使用按日期命名的日志文件
@@ -340,7 +340,7 @@ program
 
     if (opts.follow) {
       console.log(`跟踪日志: ${logFile} (Ctrl+C 退出)\n`);
-      const { execSync } = require('child_process');
+      const { execSync } = await import('child_process');
       try {
         execSync(`tail -f ${logFile}`, { stdio: 'inherit' });
       } catch {
@@ -405,7 +405,7 @@ program
 
     // 4. Chrome浏览器
     try {
-      const { findChromePath } = require('../utils/platform');
+      const { findChromePath } = await import('../utils/platform');
       const chromePath = findChromePath();
       checks.push({
         name: 'Chrome浏览器',

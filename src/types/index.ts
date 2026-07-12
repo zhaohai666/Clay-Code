@@ -54,6 +54,8 @@ export interface GlobalConfig {
   ollamaEndpoint: string;
   /** 是否启用Docker沙箱 */
   enableDockerSandbox: boolean;
+  /** Prometheus HTTP端点端口，0表示不启动，默认0 */
+  metricsPort: number;
 }
 
 /** 默认全局配置 */
@@ -77,6 +79,7 @@ export const DEFAULT_CONFIG: GlobalConfig = {
   maxRetryCount: 3,
   ollamaEndpoint: 'http://localhost:11434',
   enableDockerSandbox: false,
+  metricsPort: 0,
 };
 
 // ============================================================

@@ -209,6 +209,7 @@ export class ConfigManager {
       maxRetryCount: override.maxRetryCount ?? base.maxRetryCount,
       ollamaEndpoint: override.ollamaEndpoint ?? base.ollamaEndpoint,
       enableDockerSandbox: override.enableDockerSandbox ?? base.enableDockerSandbox,
+      metricsPort: override.metricsPort ?? base.metricsPort,
     };
   }
 }

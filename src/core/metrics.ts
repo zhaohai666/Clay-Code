@@ -1,9 +1,11 @@
 /**
  * ClayCode 监控指标模块
  * Prometheus格式指标采集：AI延迟/内存/文件操作/命令成功率/浏览器重启
+ * 支持HTTP端点暴露/metrics供Prometheus采集（README 8.4节）
  */
 
 import * as os from 'os';
+import * as http from 'http';
 import { MetricsData } from '../types';
 import { logger } from '../utils';
 
@@ -13,6 +15,8 @@ export interface MetricsCollectorOptions {
   collectInterval?: number;
   /** 是否启用，默认true */
   enabled?: boolean;
+  /** Prometheus HTTP端点端口，默认9090，设为0则不启动 */
+  httpPort?: number;
 }
 
 /**
@@ -23,6 +27,8 @@ export class MetricsCollector {
   private enabled: boolean;
   private collectInterval: number;
   private timer?: ReturnType<typeof setInterval>;
+  private httpPort: number;
+  private httpServer?: http.Server;
 
   // ---- 指标存储 ----
   private aiLatencies: number[] = [];
@@ -35,12 +41,67 @@ export class MetricsCollector {
   constructor(options?: MetricsCollectorOptions) {
     this.enabled = options?.enabled ?? true;
     this.collectInterval = options?.collectInterval ?? 30_000;
+    this.httpPort = options?.httpPort ?? 0;
     this.startTime = Date.now();
     this.lastCollectTime = Date.now();
 
     if (this.enabled) {
       this.timer = setInterval(() => this.collect(), this.collectInterval);
     }
+  }
+
+  /**
+   * 启动Prometheus HTTP端点
+   * 暴露/metrics端点供Prometheus采集指标
+   * README 8.4节：内置性能监控指标，可对接Prometheus采集
+   */
+  startHttpServer(port?: number): Promise<void> {
+    const listenPort = port ?? this.httpPort;
+    if (!listenPort || listenPort <= 0) {
+      logger.debug('[MetricsCollector] HTTP端点未配置，跳过启动');
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      this.httpServer = http.createServer((req, res) => {
+        if (req.url === '/metrics' && req.method === 'GET') {
+          res.writeHead(200, {
+            'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
+          });
+          res.end(this.toPrometheusFormat());
+        } else if (req.url === '/health' && req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', uptime: Math.floor((Date.now() - this.startTime) / 1000) }));
+        } else {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found');
+        }
+      });
+
+      this.httpServer.on('error', (err: Error) => {
+        logger.error(`[MetricsCollector] HTTP端点启动失败: ${err.message}`);
+        reject(err);
+      });
+
+      this.httpServer.listen(listenPort, () => {
+        logger.info(`[MetricsCollector] Prometheus HTTP端点已启动: http://localhost:${listenPort}/metrics`);
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * 停止Prometheus HTTP端点
+   */
+  stopHttpServer(): Promise<void> {
+    if (!this.httpServer) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.httpServer!.close(() => {
+        this.httpServer = undefined;
+        logger.info('[MetricsCollector] Prometheus HTTP端点已停止');
+        resolve();
+      });
+    });
   }
 
   // ---- 指标记录API ----
@@ -173,11 +234,12 @@ export class MetricsCollector {
   }
 
   /** 销毁采集器 */
-  destroy(): void {
+  async destroy(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+    await this.stopHttpServer();
     this.enabled = false;
   }
 }

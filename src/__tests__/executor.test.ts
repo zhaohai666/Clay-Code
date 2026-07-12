@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { LocalExecutor } from '../core/executor';
 import { ToolCall } from '../types';
+import { normalizePath } from '../utils';
 
 describe('LocalExecutor', () => {
   let tmpDir: string;
@@ -35,7 +36,7 @@ describe('LocalExecutor', () => {
       expect(result.outputText).toContain('1: line1');
       expect(result.outputText).toContain('2: line2');
       expect(result.outputText).toContain('3: line3');
-      expect(result.operateFiles).toContain(filePath);
+      expect(result.operateFiles).toContain(normalizePath(filePath));
     });
 
     it('文件不存在应返回错误', async () => {
