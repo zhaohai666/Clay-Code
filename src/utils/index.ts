@@ -14,3 +14,4 @@ export {
   ProgressBar, terminal, createFileProgressBar, AIPulseIndicator,
 } from './progress';
 export type { ProgressBarOptions } from './progress';
+export { CommandHistory } from './history';

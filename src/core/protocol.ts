@@ -9,7 +9,7 @@ import {
   ChatMessage, ExecuteResult, ErrorCode, GlobalConfig,
   FileChangeRecord,
 } from '../types';
-import { logger, cleanStreamOutput, extractCodeBlocks, extractInlineJSON, safeParseJSON } from '../utils';
+import { logger, cleanStreamOutput, extractCodeBlocks, extractInlineJSON, safeParseJSON, StreamBuffer } from '../utils';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -206,7 +206,7 @@ export class ProtocolConverter {
   }
 
   /** 验证是否为有效的工具调用对象 */
-  private isValidToolCall(obj: unknown): boolean {
+  isValidToolCall(obj: unknown): boolean {
     if (typeof obj !== 'object' || obj === null) return false;
     const record = obj as Record<string, unknown>;
     if (typeof record['tool'] !== 'string') return false;
@@ -340,5 +340,154 @@ export class ProtocolConverter {
     }
 
     return context;
+  }
+}
+
+/**
+ * 流式工具调用解析器
+ * 实现AI流式响应边解析边执行（README 5.3 性能核心优化）
+ * 基于StreamBuffer增量缓冲，检测到完整代码块时立即解析工具调用
+ */
+export class StreamingToolCallParser {
+  private buffer: StreamBuffer;
+  private protocol: ProtocolConverter;
+  private parsedToolCalls: ToolCall[] = [];
+  private onToolCallCallback?: (toolCall: ToolCall, index: number) => void;
+
+  constructor(config: GlobalConfig) {
+    this.buffer = new StreamBuffer();
+    this.protocol = new ProtocolConverter(config);
+  }
+
+  /**
+   * 设置工具调用回调
+   * 当流式解析出完整工具调用时立即触发
+   */
+  onToolCall(callback: (toolCall: ToolCall, index: number) => void): void {
+    this.onToolCallCallback = callback;
+  }
+
+  /**
+   * 追加流式文本块
+   * 检测到完整代码块时自动解析并触发回调
+   * @returns 本次追加新解析出的工具调用数量
+   */
+  append(chunk: string): number {
+    this.buffer.append(chunk);
+
+    // 检查是否有完整的代码块
+    if (!this.buffer.hasCompleteCodeBlock()) {
+      return 0;
+    }
+
+    // 尝试提取工具调用文本
+    const toolText = this.buffer.tryExtractToolText();
+    if (!toolText) {
+      return 0;
+    }
+
+    // 解析工具调用
+    const newCalls = this.parseFromText(toolText);
+    const beforeCount = this.parsedToolCalls.length;
+
+    for (const call of newCalls) {
+      // 避免重复解析（通过JSON序列化去重）
+      const isDuplicate = this.parsedToolCalls.some(
+        existing => JSON.stringify(existing) === JSON.stringify(call)
+      );
+      if (!isDuplicate) {
+        this.parsedToolCalls.push(call);
+        const index = this.parsedToolCalls.length - 1;
+        this.onToolCallCallback?.(call, index);
+      }
+    }
+
+    return this.parsedToolCalls.length - beforeCount;
+  }
+
+  /**
+   * 获取目前已解析的所有工具调用
+   */
+  getParsedToolCalls(): ToolCall[] {
+    return [...this.parsedToolCalls];
+  }
+
+  /**
+   * 获取当前缓冲区中的纯文本内容（非工具调用部分）
+   * 用于提取AI的文本回复
+   */
+  getTextContent(): string {
+    const content = this.buffer.getContent();
+    // 移除代码块部分，保留纯文本
+    return content
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  /**
+   * 完成流式解析，返回最终结果
+   * 对缓冲区剩余内容做最终解析
+   */
+  finalize(): ToolCall[] {
+    // 对完整缓冲区做最终解析（处理可能遗漏的行内JSON）
+    const fullContent = this.buffer.getContent();
+    const finalCalls = this.protocol.parseToolCalls(fullContent);
+
+    // 合并去重
+    for (const call of finalCalls) {
+      const isDuplicate = this.parsedToolCalls.some(
+        existing => JSON.stringify(existing) === JSON.stringify(call)
+      );
+      if (!isDuplicate) {
+        this.parsedToolCalls.push(call);
+        const index = this.parsedToolCalls.length - 1;
+        this.onToolCallCallback?.(call, index);
+      }
+    }
+
+    return this.getParsedToolCalls();
+  }
+
+  /**
+   * 重置解析器状态
+   */
+  reset(): void {
+    this.buffer.clear();
+    this.parsedToolCalls = [];
+  }
+
+  /**
+   * 从文本解析工具调用
+   */
+  private parseFromText(text: string): ToolCall[] {
+    const toolCalls: ToolCall[] = [];
+
+    // 尝试解析为JSON数组或对象
+    const parsed = safeParseJSON(text);
+    if (parsed) {
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (this.protocol.isValidToolCall(item)) {
+            toolCalls.push(item as ToolCall);
+          }
+        }
+      } else if (this.protocol.isValidToolCall(parsed)) {
+        toolCalls.push(parsed as ToolCall);
+      }
+    }
+
+    // 如果JSON解析失败，尝试行内JSON
+    if (toolCalls.length === 0) {
+      const inlineJSONs = extractInlineJSON(text);
+      for (const jsonStr of inlineJSONs) {
+        const inlineParsed = safeParseJSON(jsonStr);
+        if (inlineParsed && this.protocol.isValidToolCall(inlineParsed)) {
+          toolCalls.push(inlineParsed as ToolCall);
+        }
+      }
+    }
+
+    return toolCalls;
   }
 }

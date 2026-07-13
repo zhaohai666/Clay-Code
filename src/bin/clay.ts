@@ -11,6 +11,7 @@ import { SessionManager } from '../core/session';
 import { PluginManager } from '../core/plugin';
 import { MetricsCollector } from '../core/metrics';
 import { logger, LogLevel } from '../utils';
+import { CommandHistory } from '../utils/history';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -94,14 +95,20 @@ program
         ? sessionManager.getSession(opts.session)
         : sessionManager.createSession();
 
-      console.log(`\n💬 ClayCode 对话模式 (会话: ${session.sessionId})`);
+      console.log('\n💬 ClayCode 对话模式 (会话: ${session.sessionId})');
       console.log('输入消息开始对话，输入 .quit 退出，输入 .clear 清空会话\n');
+
+      // 初始化命令历史持久化
+      const commandHistory = new CommandHistory();
 
       const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
         prompt: '> ',
       });
+
+      // 注入历史记录到readline
+      commandHistory.injectToReadline(rl);
 
       rl.prompt();
 
@@ -111,6 +118,9 @@ program
           rl.prompt();
           return;
         }
+
+        // 记录命令到历史
+        commandHistory.add(input);
 
         if (input === '.quit') {
           console.log('再见！');
@@ -547,6 +557,22 @@ program
     console.log(`  浏览器重启: ${snapshot.browserRestarts}次\n`);
   });
 
+// ---- clay completion ----
+program
+  .command('completion')
+  .description('生成Shell自动补全脚本')
+  .argument('<shell>', 'Shell类型: bash | zsh')
+  .action((shell: string) => {
+    if (shell === 'bash') {
+      console.log(generateBashCompletion());
+    } else if (shell === 'zsh') {
+      console.log(generateZshCompletion());
+    } else {
+      console.error('不支持的Shell类型，请使用 bash 或 zsh');
+      process.exit(1);
+    }
+  });
+
 // ---- 辅助函数 ----
 
 function printResponse(response: { code: number; msg: string; data?: { toolCalls?: unknown[]; appendChatMsg?: { role: string; content: string } } }): void {
@@ -564,6 +590,189 @@ function printResponse(response: { code: number; msg: string; data?: { toolCalls
   }
 
   console.log(`\n${response.msg}`);
+}
+
+/**
+ * 生成Bash自动补全脚本
+ */
+function generateBashCompletion(): string {
+  return `# ClayCode Bash 自动补全
+# 安装: clay completion bash >> ~/.bashrc
+# 或:   clay completion bash >> ~/.bash_profile
+
+_clay_completion() {
+  local cur prev commands options adapters config_keys session_actions
+  
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  
+  commands="agent chat login config session log doctor plugin metrics completion"
+  adapters="doubao chatgpt-web claude-web ollama kimi qwen"
+  config_keys="defaultAdapter dataDir browserDataPath chromePath sessionDir maxContextChunk maxHistoryMessages requestTimeout responseTimeout autoSyncExecuteLog browserHeadless execWhiteList enableSandbox cacheLevel maxBatchFiles browserIdleTimeout maxRetryCount ollamaEndpoint enableDockerSandbox metricsPort apiKey proxyUrl"
+  session_actions="new use recover list delete"
+  
+  if [[ \${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=($(compgen -W "\${commands}" -- "\${cur}"))
+    return 0
+  fi
+  
+  case "\${prev}" in
+    -a|--adapter)
+      COMPREPLY=($(compgen -W "\${adapters}" -- "\${cur}"))
+      return 0
+      ;;
+    clay)
+      COMPREPLY=($(compgen -W "\${commands}" -- "\${cur}"))
+      return 0
+      ;;
+    config)
+      COMPREPLY=($(compgen -W "set get list reset" -- "\${cur}"))
+      return 0
+      ;;
+    session)
+      COMPREPLY=($(compgen -W "\${session_actions}" -- "\${cur}"))
+      return 0
+      ;;
+    set)
+      COMPREPLY=($(compgen -W "\${config_keys}" -- "\${cur}"))
+      return 0
+      ;;
+    completion)
+      COMPREPLY=($(compgen -W "bash zsh" -- "\${cur}"))
+      return 0
+      ;;
+  esac
+  
+  # 子命令补全
+  local subcmd="\${COMP_WORDS[1]}"
+  case "\${subcmd}" in
+    config|session)
+      if [[ \${COMP_CWORD} -eq 2 ]]; then
+        if [[ "\${subcmd}" == "config" ]]; then
+          COMPREPLY=($(compgen -W "set get list reset" -- "\${cur}"))
+        else
+          COMPREPLY=($(compgen -W "\${session_actions}" -- "\${cur}"))
+        fi
+      fi
+      ;;
+  esac
+  
+  return 0
+}
+
+complete -F _clay_completion clay
+`;
+}
+
+/**
+ * 生成Zsh自动补全脚本
+ */
+function generateZshCompletion(): string {
+  return `#compdef clay
+# ClayCode Zsh 自动补全
+# 安装: clay completion zsh > ~/.zfunc/_clay
+# 并确保 ~/.zshrc 中有: fpath+=~/.zfunc && autoload -U compinit && compinit
+
+_clay() {
+  local -a commands adapters config_keys session_actions
+  
+  commands=(
+    'agent:Agent模式，自主执行编码任务'
+    'chat:交互式对话模式'
+    'login:打开浏览器登录AI平台'
+    'config:查看或修改配置'
+    'session:管理会话'
+    'log:查看日志'
+    'doctor:诊断环境问题'
+    'plugin:管理插件'
+    'metrics:查看监控指标'
+    'completion:生成Shell自动补全脚本'
+  )
+  
+  adapters=('doubao:豆包' 'chatgpt-web:ChatGPT网页版' 'claude-web:Claude网页版' 'ollama:Ollama本地模型' 'kimi:Kimi' 'qwen:通义千问')
+  
+  config_keys=(
+    'defaultAdapter:默认AI适配器'
+    'dataDir:数据根目录'
+    'browserDataPath:浏览器数据路径'
+    'chromePath:Chrome路径'
+    'sessionDir:会话目录'
+    'maxContextChunk:最大上下文分块'
+    'maxHistoryMessages:最大历史消息数'
+    'requestTimeout:请求超时'
+    'responseTimeout:回复超时'
+    'browserHeadless:浏览器无头模式'
+    'enableSandbox:启用沙箱'
+    'cacheLevel:缓存级别'
+    'ollamaEndpoint:Ollama端点'
+    'apiKey:API密钥'
+    'proxyUrl:代理URL'
+  )
+  
+  session_actions=('new:新建会话' 'use:切换会话' 'recover:恢复会话' 'list:列出会话' 'delete:删除会话')
+  
+  _arguments -C \\
+    '1:command:->command' \\
+    '*::arg:->args'
+  
+  case $state in
+    command)
+      _describe 'command' commands
+      ;;
+    args)
+      case $words[1] in
+        agent)
+          _arguments \\
+            '-a[AI适配器]:adapter:($adapters)' \\
+            '-s[会话ID]:session-id:' \\
+            '-r[最大轮次]:rounds:' \\
+            '--cwd[工作目录]:dir:_dirs' \\
+            '1:task:'
+          ;;
+        chat)
+          _arguments \\
+            '-a[AI适配器]:adapter:($adapters)' \\
+            '-s[会话ID]:session-id:' \\
+            '--cwd[工作目录]:dir:_dirs'
+          ;;
+        login)
+          _arguments '-a[AI适配器]:adapter:($adapters)'
+          ;;
+        config)
+          case $words[2] in
+            set)
+              _arguments \\
+                '1:config key:($config_keys)' \\
+                '2:config value:'
+              ;;
+            get)
+              _arguments '1:config key:($config_keys)'
+              ;;
+            *)
+              _describe 'config action' 'set:get:list:reset'
+              ;;
+          esac
+          ;;
+        session)
+          case $words[2] in
+            new|use|recover|delete)
+              ;;
+            *)
+              _describe 'session action' session_actions
+              ;;
+          esac
+          ;;
+        completion)
+          _arguments '1:shell:(bash zsh)'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_clay "$@"
+`;
 }
 
 // ---- 启动 ----

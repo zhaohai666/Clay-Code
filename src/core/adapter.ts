@@ -51,6 +51,24 @@ const ADAPTER_CONFIGS: Record<WebAdapterType, AdapterConfig> = {
     responseSelector: '.markdown-content:last-child',
     loginUrl: 'https://claude.ai/login',
   },
+  kimi: {
+    name: 'kimi',
+    displayName: 'Kimi',
+    url: 'https://kimi.moonshot.cn/',
+    inputSelector: 'textarea[class*="chat-input"]',
+    sendButtonSelector: 'button[class*="send"]',
+    responseSelector: '.mark-down:last-child',
+    loginUrl: 'https://kimi.moonshot.cn/',
+  },
+  qwen: {
+    name: 'qwen',
+    displayName: '通义千问',
+    url: 'https://tongyi.aliyun.com/qianwen/',
+    inputSelector: 'textarea[class*="input"]',
+    sendButtonSelector: 'button[class*="send"]',
+    responseSelector: '.markdown-body:last-child',
+    loginUrl: 'https://tongyi.aliyun.com/qianwen/',
+  },
 };
 
 /**
@@ -216,6 +234,80 @@ export class OllamaAdapter implements WebAIAdapter {
     } catch (err) {
       logger.error(`[Ollama] 请求失败: ${(err as Error).message}`);
       throw err;
+    }
+  }
+
+  /**
+   * 发送消息并流式获取回复（README 5.3 流式实时解析）
+   * 使用Ollama /api/chat 接口的stream模式，边接收边yield文本块
+   */
+  async *askStream(prompt: string, sessionId: string): AsyncIterableIterator<string> {
+    logger.info(`[Ollama] 流式发送消息 (会话: ${sessionId.slice(0, 8)}..., 模型: ${this.model})`);
+
+    const http = await import('http');
+    const requestBody = JSON.stringify({
+      model: this.model,
+      messages: [{ role: 'user', content: prompt }],
+      stream: true,
+    });
+
+    const url = new URL('/api/chat', this.endpoint);
+
+    const responseStream = await new Promise<import('http').IncomingMessage>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port || '11434',
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(requestBody),
+          },
+        },
+        (res) => resolve(res),
+      );
+
+      req.on('error', (err: Error) => reject(new Error(`Ollama连接失败: ${err.message}`)));
+      req.setTimeout(120000, () => { req.destroy(); reject(new Error('Ollama请求超时')); });
+      req.write(requestBody);
+      req.end();
+    });
+
+    let buffer = '';
+    for await (const chunk of responseStream) {
+      buffer += chunk.toString();
+      // Ollama流式响应每行是一个JSON对象
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // 保留最后一个可能不完整的行
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.message?.content) {
+            yield parsed.message.content;
+          }
+          if (parsed.done) {
+            return;
+          }
+        } catch {
+          // 忽略解析失败的行
+        }
+      }
+    }
+
+    // 处理缓冲区剩余内容
+    if (buffer.trim()) {
+      try {
+        const parsed = JSON.parse(buffer.trim());
+        if (parsed.message?.content) {
+          yield parsed.message.content;
+        }
+      } catch {
+        // 忽略
+      }
     }
   }
 

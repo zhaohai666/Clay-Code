@@ -16,7 +16,7 @@ const CONFIG_DIR = path.join(os.homedir(), '.claycode');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
 /** 需要加密的敏感字段 */
-const SENSITIVE_FIELDS: (keyof GlobalConfig)[] = [];
+const SENSITIVE_FIELDS: (keyof GlobalConfig)[] = ['apiKey', 'proxyUrl', 'ollamaEndpoint'];
 
 export class ConfigManager {
   private config: GlobalConfig;
@@ -210,6 +210,8 @@ export class ConfigManager {
       ollamaEndpoint: override.ollamaEndpoint ?? base.ollamaEndpoint,
       enableDockerSandbox: override.enableDockerSandbox ?? base.enableDockerSandbox,
       metricsPort: override.metricsPort ?? base.metricsPort,
+      apiKey: override.apiKey ?? base.apiKey,
+      proxyUrl: override.proxyUrl ?? base.proxyUrl,
     };
   }
 }

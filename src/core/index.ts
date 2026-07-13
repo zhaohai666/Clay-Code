@@ -17,8 +17,9 @@ import { ConfigManager } from './config';
 import { SessionManager } from './session';
 import { BrowserBridge } from './browser';
 import { ProtocolConverter } from './protocol';
+import { StreamingToolCallParser } from './protocol';
 import { LocalExecutor } from './executor';
-import { AdapterFactory } from './adapter';
+import { AdapterFactory, OllamaAdapter } from './adapter';
 import { SecurityManager } from './security';
 import { CacheManager } from './cache';
 import { PluginManager } from './plugin';
@@ -412,8 +413,188 @@ export class ClayCodeEngine {
   }
 
   /**
-   * 带指数退避重试的AI请求
-   * 全链路异常恢复：网络波动指数退避重试，最大3次
+   * 流式任务处理（README 5.3 流式实时工具调用解析）
+   * AI流式响应边解析边执行工具调用，无需等待完整回复
+   * 仅在适配器支持askStream时启用，否则回退到普通模式
+   */
+  async processTaskStreaming(
+    task: string,
+    sessionId?: string,
+    onProgress?: (state: EngineState, msg: string) => void,
+    onToolCall?: (toolCall: ToolCall, index: number) => void,
+  ): Promise<TaskResponse> {
+    const session = sessionId
+      ? this.sessionManager.getSession(sessionId) || this.sessionManager.createSession(undefined, this.config.defaultAdapter, this.cwd)
+      : this.sessionManager.createSession(undefined, this.config.defaultAdapter, this.cwd);
+
+    const adapterName = this.config.defaultAdapter;
+    const adapter = this.adapterFactory.getAdapter(adapterName);
+
+    // 检查适配器是否支持流式（仅OllamaAdapter支持askStream）
+    if (!('askStream' in adapter) || typeof (adapter as OllamaAdapter).askStream !== 'function') {
+      logger.info('[ClayCodeEngine] 适配器不支持流式，回退到普通模式');
+      return this.processTask(task, session.sessionId, onProgress);
+    }
+
+    const streamAdapter = adapter as OllamaAdapter;
+
+    // 初始化：检查登录状态
+    const isLoggedIn = await adapter.isLoggedIn();
+    if (!isLoggedIn) {
+      const loginUrl = adapter.getLoginUrl();
+      return this.protocol.buildErrorResponse(
+        ErrorCode.HUMAN_VERIFICATION,
+        `未登录，请先执行 clay login 打开浏览器登录: ${loginUrl}`,
+      );
+    }
+    this.changedFiles.clear();
+    this.tempVars.clear();
+
+    const projectContext = await this.buildInitialProjectContext();
+    this.sessionManager.addMessage(session.sessionId, { role: 'user', content: task });
+
+    const request: TaskRequest = {
+      userPrompt: task,
+      projectChunkContext: projectContext,
+      sessionHistory: session.messages.slice(-this.config.maxHistoryMessages),
+    };
+
+    const streamParser = new StreamingToolCallParser(this.config);
+    if (onToolCall) {
+      streamParser.onToolCall(onToolCall);
+    }
+
+    let round = 0;
+    let lastResponse: TaskResponse | null = null;
+    let noToolCallRetryCount = 0;
+
+    while (round < this.maxRounds) {
+      round++;
+      this.state = 'thinking';
+      onProgress?.('thinking', `第 ${round} 轮：流式等待AI回复...`);
+      logger.info(`[ClayCodeEngine] === 流式第 ${round} 轮 ===`);
+
+      try {
+        // 1. 流式发送给AI
+        const prompt = this.protocol.buildPrompt(request);
+        streamParser.reset();
+
+        this.state = 'thinking';
+        for await (const chunk of streamAdapter.askStream(prompt, session.sessionId)) {
+          const newCallCount = streamParser.append(chunk);
+          if (newCallCount > 0) {
+            logger.info(`[ClayCodeEngine] 流式解析到 ${newCallCount} 个新工具调用`);
+          }
+        }
+
+        // 2. 最终解析
+        const toolCalls = streamParser.finalize();
+
+        // 3. 获取AI文本回复
+        const textContent = streamParser.getTextContent();
+
+        // 4. 如果没有工具调用
+        if (toolCalls.length === 0) {
+          noToolCallRetryCount++;
+          if (noToolCallRetryCount <= MAX_NO_TOOLCALL_RETRY) {
+            logger.info(`[ClayCodeEngine] AI未返回工具调用，追加提示词重试(${noToolCallRetryCount}/${MAX_NO_TOOLCALL_RETRY})`);
+            this.sessionManager.addMessage(session.sessionId, { role: 'ai', content: textContent });
+            this.sessionManager.addMessage(session.sessionId, {
+              role: 'system',
+              content: '请使用标准JSON工具调用格式输出操作指令，不要仅回复文本说明。参考系统提示中的工具格式。',
+            });
+            request.sessionHistory = session.messages.slice(-this.config.maxHistoryMessages);
+            continue;
+          }
+
+          this.sessionManager.addMessage(session.sessionId, { role: 'ai', content: textContent });
+          lastResponse = this.protocol.buildResponse(0, 'AI文本回复', [], {
+            role: 'ai',
+            content: textContent,
+          });
+          break;
+        }
+
+        noToolCallRetryCount = 0;
+
+        // 5. 执行工具调用
+        this.state = 'executing';
+        onProgress?.('executing', `第 ${round} 轮：执行 ${toolCalls.length} 个工具调用...`);
+        const results = await this.executor.executeBatch(toolCalls);
+
+        // 6. 记录监控与文件变更
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          const tc = toolCalls[i];
+          if (tc) {
+            this.metrics.recordFileOperation(tc.tool as 'read' | 'write' | 'edit' | 'bash');
+            if (tc.filePath && ['write', 'edit'].includes(tc.tool)) {
+              this.changedFiles.add(tc.filePath);
+            }
+          }
+          this.metrics.recordCommandResult(result.success);
+        }
+
+        // 7. 汇总执行结果
+        const combinedResult = this.summarizeResults(results);
+        this.sessionManager.addMessage(session.sessionId, { role: 'ai', content: textContent || JSON.stringify(toolCalls) });
+        this.sessionManager.addMessage(session.sessionId, this.protocol.executionResultToMessage(combinedResult));
+
+        // 8. 更新请求上下文
+        request.sessionHistory = session.messages.slice(-this.config.maxHistoryMessages);
+        request.lastExecuteOutput = combinedResult;
+
+        // 增量上下文
+        if (this.changedFiles.size > 0) {
+          request.projectChunkContext = this.protocol.buildIncrementalContextFromFiles(
+            this.cwd,
+            Array.from(this.changedFiles),
+            combinedResult,
+          );
+        }
+
+        lastResponse = this.protocol.buildResponse(0, `执行${combinedResult.success ? '成功' : '失败'}`, toolCalls);
+
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        logger.error(`[ClayCodeEngine] 流式处理错误: ${error.message}`);
+
+        // 浏览器崩溃恢复
+        if (error.message.includes('Target closed') || error.message.includes('Session closed')) {
+          try {
+            await this.browserBridge.attemptRestart();
+            logger.info('[ClayCodeEngine] 浏览器重启成功，继续处理');
+            continue;
+          } catch (restartErr) {
+            logger.error(`[ClayCodeEngine] 浏览器重启失败: ${restartErr instanceof Error ? restartErr.message : String(restartErr)}`);
+          }
+        }
+
+        this.state = 'error';
+        lastResponse = this.protocol.buildErrorResponse(ErrorCode.RESPONSE_TIMEOUT, error.message);
+        break;
+      }
+    }
+
+    if (round >= this.maxRounds) {
+      lastResponse = this.protocol.buildErrorResponse(
+        ErrorCode.CONTEXT_TOO_LONG,
+        `达到最大执行轮次 ${this.maxRounds}`,
+      );
+    }
+
+    this.state = 'idle';
+    onProgress?.('idle', '流式任务完成');
+    this.tempVars.clear();
+    this.changedFiles.clear();
+    this.sessionManager.persistSession(session.sessionId);
+    this.resetBrowserIdleTimer();
+
+    return lastResponse || this.protocol.buildErrorResponse(ErrorCode.RESPONSE_TIMEOUT, '无响应');
+  }
+
+  /**
+   * 全链路异常恢复: 网络波动指数退避重试，最大3次
    */
   private async askWithRetry(
     adapter: { ask: (prompt: string, sessionId: string) => Promise<string> },

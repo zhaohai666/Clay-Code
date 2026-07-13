@@ -9,7 +9,7 @@
 // ============================================================
 
 /** 支持的网页AI适配器类型 */
-export type AdapterType = 'doubao' | 'chatgpt-web' | 'claude-web' | 'ollama';
+export type AdapterType = 'doubao' | 'chatgpt-web' | 'claude-web' | 'ollama' | 'kimi' | 'qwen';
 
 /** 缓存级别 */
 export type CacheLevel = 'l1' | 'l2' | 'l1+l2' | 'none';
@@ -56,6 +56,10 @@ export interface GlobalConfig {
   enableDockerSandbox: boolean;
   /** Prometheus HTTP端点端口，0表示不启动，默认0 */
   metricsPort: number;
+  /** API密钥（用于需要显式认证的适配器，AES加密存储） */
+  apiKey: string;
+  /** 代理URL（可包含认证信息，AES加密存储） */
+  proxyUrl: string;
 }
 
 /** 默认全局配置 */
@@ -80,6 +84,8 @@ export const DEFAULT_CONFIG: GlobalConfig = {
   ollamaEndpoint: 'http://localhost:11434',
   enableDockerSandbox: false,
   metricsPort: 0,
+  apiKey: '',
+  proxyUrl: '',
 };
 
 // ============================================================
@@ -244,6 +250,8 @@ export interface WebAIAdapter {
   responseSelector: string;
   /** 发送消息并获取回复 */
   ask(prompt: string, sessionId: string): Promise<string>;
+  /** 发送消息并流式获取回复（边接收边解析） */
+  askStream?(prompt: string, sessionId: string): AsyncIterableIterator<string>;
   /** 检查是否已登录 */
   isLoggedIn(): Promise<boolean>;
   /** 获取登录URL */
