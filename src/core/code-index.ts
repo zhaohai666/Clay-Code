@@ -1,14 +1,16 @@
 /**
  * @claycode/code-index 代码符号索引模块 (V1.2)
- * 轻量级正则符号索引器，零外部依赖
+ * 基于 Tree-sitter WASM 实现代码符号索引，纯 WebAssembly 运行
  * 提取类、函数、接口、常量、类型定义符号，构建内存索引
  * 支持 symbol_search 工具精准定位代码片段
  * 支持 TypeScript/JavaScript, Java, Go, Python, C/C++, Rust
+ * 当 Tree-sitter 不可用时，自动回退到正则解析
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../utils';
+import { treeSitterLoader, TreeSitterLanguageConfig } from './tree-sitter-loader';
 
 // ============================================================
 // 类型定义
@@ -225,7 +227,7 @@ const INDEX_IGNORE_DIRS = new Set([
 
 /**
  * 代码符号索引器
- * 轻量级正则实现，零外部依赖
+ * 基于 Tree-sitter WASM 实现，自动回退到正则解析
  */
 export class CodeIndexer {
   /** 项目根目录 */
@@ -234,23 +236,46 @@ export class CodeIndexer {
   private fileIndexes: Map<string, FileIndex> = new Map();
   /** 符号名称索引（名称 -> 符号列表） */
   private symbolByName: Map<string, CodeSymbol[]> = new Map();
-  /** 语言扩展名映射 */
+  /** 语言扩展名映射（正则回退用） */
   private extensionToLanguage: Map<string, LanguagePattern> = new Map();
   /** 最大索引文件数 */
   private maxFiles: number;
   /** 最大单文件行数（超过跳过） */
   private maxFileLines: number;
+  /** Tree-sitter 是否已初始化 */
+  private treeSitterReady: boolean = false;
 
   constructor(projectRoot: string, maxFiles: number = 500, maxFileLines: number = 5000) {
     this.projectRoot = projectRoot;
     this.maxFiles = maxFiles;
     this.maxFileLines = maxFileLines;
 
-    // 构建扩展名到语言映射
+    // 构建扩展名到语言映射（正则回退用）
     for (const lang of LANGUAGE_PATTERNS) {
       for (const ext of lang.extensions) {
         this.extensionToLanguage.set(ext, lang);
       }
+    }
+  }
+
+  /**
+   * 初始化 Tree-sitter WASM 运行时
+   * 调用此方法后，索引将优先使用 Tree-sitter AST 解析
+   * 未调用或初始化失败时，自动回退到正则解析
+   */
+  async init(): Promise<void> {
+    try {
+      const success = await treeSitterLoader.init();
+      this.treeSitterReady = success;
+      if (success) {
+        logger.info('[CodeIndexer] Tree-sitter WASM 已就绪，将使用 AST 解析');
+      } else {
+        logger.info('[CodeIndexer] Tree-sitter 不可用，使用正则解析');
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`[CodeIndexer] Tree-sitter 初始化异常，使用正则解析: ${message}`);
+      this.treeSitterReady = false;
     }
   }
 
@@ -284,7 +309,7 @@ export class CodeIndexer {
       }
     });
 
-    logger.info(`[CodeIndexer] 索引完成: ${filesIndexed}个文件, ${symbolsFound}个符号`);
+    logger.info(`[CodeIndexer] 索引完成: ${filesIndexed}个文件, ${symbolsFound}个符号 (模式: ${this.treeSitterReady ? 'Tree-sitter WASM' : '正则'})`);
     return { filesIndexed, symbolsFound };
   }
 
@@ -300,47 +325,64 @@ export class CodeIndexer {
         return null;
       }
 
-      const symbols: CodeSymbol[] = [];
-      const imports: string[] = [];
-
-      // 解析符号
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        for (const pattern of langPattern.patterns) {
-          const match = line.match(pattern.regex);
-          if (match) {
-            const name = match[pattern.nameGroup];
-            if (name && /^\w+$/.test(name)) {
-              const symbol: CodeSymbol = {
-                name,
-                kind: pattern.kind,
-                filePath: relPath,
-                line: i + 1,
-                column: line.indexOf(name) + 1,
-                language: langPattern.language,
-              };
-              if (pattern.signatureGroup && match[pattern.signatureGroup]) {
-                symbol.signature = match[pattern.signatureGroup];
-              }
-              if (pattern.parentGroup && match[pattern.parentGroup]) {
-                symbol.parentName = match[pattern.parentGroup];
-              }
-              symbols.push(symbol);
-            }
-          }
-        }
+      // 优先使用 Tree-sitter AST 解析
+      if (this.treeSitterReady) {
+        const tsResult = this.indexFileWithTreeSitter(relPath, content, langPattern);
+        if (tsResult) return tsResult;
+        // Tree-sitter 解析失败，回退到正则
+        logger.debug(`[CodeIndexer] Tree-sitter 解析失败，回退到正则: ${relPath}`);
       }
 
-      // 解析导入
-      let importMatch: RegExpExecArray | null;
-      const importRegex = new RegExp(langPattern.importPattern.source, langPattern.importPattern.flags);
-      while ((importMatch = importRegex.exec(content)) !== null) {
-        for (let g = 1; g < importMatch.length; g++) {
-          if (importMatch[g]) {
-            imports.push(importMatch[g]);
-          }
-        }
+      // 正则回退解析
+      return this.indexFileWithRegex(relPath, content, lines, langPattern);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.debug(`[CodeIndexer] 索引文件失败: ${relPath} - ${message}`);
+      return null;
+    }
+  }
+
+  /**
+   * 使用 Tree-sitter WASM 解析文件
+   * 基于 AST 遍历提取符号和导入，比正则更准确
+   */
+  private indexFileWithTreeSitter(relPath: string, content: string, langPattern: LanguagePattern): FileIndex | null {
+    try {
+      const ext = path.extname(relPath);
+      const tsConfig = treeSitterLoader.getLanguageConfig(ext);
+      if (!tsConfig) return null;
+
+      // 同步获取已加载的语言（indexProject 前应已调用 init()）
+      // 注意：Tree-sitter parse 是同步的，但语言加载是异步的
+      // 这里使用已缓存的语言，如果语言未加载则返回 null 回退到正则
+      const langName = tsConfig.name;
+
+      // 使用 TreeSitterLoader 的 parse 方法（同步版本）
+      // 由于 web-tree-sitter 的 parse 是同步的，我们直接调用
+      if (!treeSitterLoader.isInitialized()) return null;
+
+      // 通过 loader 获取已加载的语言
+      const language = treeSitterLoader.getLoadedLanguage(langName);
+      if (!language) {
+        // 语言未加载，尝试标记需要异步加载（下次 init 时加载）
+        // 当前回退到正则
+        return null;
       }
+
+      const parser = treeSitterLoader.getParser();
+      if (!parser) return null;
+
+      parser.setLanguage(language);
+      const tree = parser.parse(content);
+      if (!tree) return null;
+
+      // 从 AST 提取符号
+      const symbols = treeSitterLoader.extractSymbols(tree, tsConfig, relPath);
+
+      // 从 AST 提取导入
+      const imports = treeSitterLoader.extractImports(tree, tsConfig);
+
+      tree.delete();
 
       return {
         filePath: relPath,
@@ -351,9 +393,64 @@ export class CodeIndexer {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.debug(`[CodeIndexer] 索引文件失败: ${relPath} - ${message}`);
+      logger.debug(`[CodeIndexer] Tree-sitter 解析异常: ${relPath} - ${message}`);
       return null;
     }
+  }
+
+  /**
+   * 使用正则解析文件（回退方案）
+   */
+  private indexFileWithRegex(relPath: string, content: string, lines: string[], langPattern: LanguagePattern): FileIndex {
+    const symbols: CodeSymbol[] = [];
+    const imports: string[] = [];
+
+    // 解析符号
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      for (const pattern of langPattern.patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+          const name = match[pattern.nameGroup];
+          if (name && /^\w+$/.test(name)) {
+            const symbol: CodeSymbol = {
+              name,
+              kind: pattern.kind,
+              filePath: relPath,
+              line: i + 1,
+              column: line.indexOf(name) + 1,
+              language: langPattern.language,
+            };
+            if (pattern.signatureGroup && match[pattern.signatureGroup]) {
+              symbol.signature = match[pattern.signatureGroup];
+            }
+            if (pattern.parentGroup && match[pattern.parentGroup]) {
+              symbol.parentName = match[pattern.parentGroup];
+            }
+            symbols.push(symbol);
+          }
+        }
+      }
+    }
+
+    // 解析导入
+    let importMatch: RegExpExecArray | null;
+    const importRegex = new RegExp(langPattern.importPattern.source, langPattern.importPattern.flags);
+    while ((importMatch = importRegex.exec(content)) !== null) {
+      for (let g = 1; g < importMatch.length; g++) {
+        if (importMatch[g]) {
+          imports.push(importMatch[g]);
+        }
+      }
+    }
+
+    return {
+      filePath: relPath,
+      language: langPattern.language,
+      symbols,
+      imports,
+      indexedAt: Date.now(),
+    };
   }
 
   /** 递归遍历目录 */

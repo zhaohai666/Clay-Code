@@ -153,7 +153,7 @@ export class LocalExecutor {
         case 'run_test':
           return this.executeRunTest(toolCall.testFilter, toolCall.testWatch);
         case 'symbol_search':
-          return this.executeSymbolSearch(toolCall.symbolName!, toolCall.symbolKind, toolCall.symbolLimit);
+          return await this.executeSymbolSearch(toolCall.symbolName!, toolCall.symbolKind, toolCall.symbolLimit);
         default:
           return {
             success: false,
@@ -1898,16 +1898,19 @@ export class LocalExecutor {
 
   /**
    * 执行代码符号搜索
-   * 基于轻量级正则索引器，支持6种语言符号精准定位
+   * 基于 Tree-sitter WASM 符号索引器，支持8种语言符号精准定位
+   * Tree-sitter 不可用时自动回退到正则解析
    * @param name 符号名称（精确/前缀/包含匹配）
    * @param kind 符号类型过滤（可选）
    * @param limit 结果上限（默认20）
    */
-  private executeSymbolSearch(name: string, kind?: string, limit?: number): ExecuteResult {
+  private async executeSymbolSearch(name: string, kind?: string, limit?: number): Promise<ExecuteResult> {
     try {
       // 懒初始化代码索引器
       if (!this.codeIndexer) {
         this.codeIndexer = new CodeIndexer(this.cwd);
+        // 初始化 Tree-sitter WASM（异步，失败时自动回退到正则）
+        await this.codeIndexer.init();
         const { filesIndexed, symbolsFound } = this.codeIndexer.indexProject();
         if (filesIndexed === 0) {
           return {

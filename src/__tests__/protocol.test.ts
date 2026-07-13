@@ -155,6 +155,135 @@ describe('ProtocolConverter', () => {
       expect(calls[0].tool).toBe('git');
       expect(calls[0].command).toBe('git status');
     });
+
+    it('应支持view工具（终端文件阅读器）', () => {
+      const aiResponse = '```json\n{ "tool": "view", "filePath": "src/app.ts", "lineRange": "10-50", "showLineNumbers": true }\n```';
+      const calls = converter.parseToolCalls(aiResponse);
+      expect(calls.length).toBe(1);
+      expect(calls[0].tool).toBe('view');
+      expect(calls[0].filePath).toBe('src/app.ts');
+      expect(calls[0].lineRange).toBe('10-50');
+      expect(calls[0].showLineNumbers).toBe(true);
+    });
+
+    it('应支持run_test工具（标准化测试）', () => {
+      const aiResponse = '```json\n{ "tool": "run_test", "testFilter": "auth.test", "testWatch": false }\n```';
+      const calls = converter.parseToolCalls(aiResponse);
+      expect(calls.length).toBe(1);
+      expect(calls[0].tool).toBe('run_test');
+      expect(calls[0].testFilter).toBe('auth.test');
+      expect(calls[0].testWatch).toBe(false);
+    });
+
+    it('应支持run_test工具无必填字段', () => {
+      const aiResponse = '```json\n{ "tool": "run_test" }\n```';
+      const calls = converter.parseToolCalls(aiResponse);
+      expect(calls.length).toBe(1);
+      expect(calls[0].tool).toBe('run_test');
+    });
+
+    it('应支持symbol_search工具（代码符号搜索）', () => {
+      const aiResponse = '```json\n{ "tool": "symbol_search", "symbolName": "UserService", "symbolKind": "class", "symbolLimit": 20 }\n```';
+      const calls = converter.parseToolCalls(aiResponse);
+      expect(calls.length).toBe(1);
+      expect(calls[0].tool).toBe('symbol_search');
+      expect(calls[0].symbolName).toBe('UserService');
+      expect(calls[0].symbolKind).toBe('class');
+      expect(calls[0].symbolLimit).toBe(20);
+    });
+
+    it('应拒绝无效的symbol_search（缺少symbolName）', () => {
+      const aiResponse = '```json\n{ "tool": "symbol_search", "symbolKind": "function" }\n```';
+      const calls = converter.parseToolCalls(aiResponse);
+      expect(calls.length).toBe(0);
+    });
+  });
+
+  // ---- isValidToolCall ----
+  describe('isValidToolCall', () => {
+    it('应接受有效的read工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'read', filePath: 'src/app.ts' })).toBe(true);
+    });
+
+    it('应接受有效的edit工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'edit', filePath: 'src/app.ts', search: 'old', replace: 'new' })).toBe(true);
+    });
+
+    it('应接受有效的write工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'write', filePath: 'src/app.ts', content: 'code' })).toBe(true);
+    });
+
+    it('应接受有效的bash工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'bash', command: 'npm test' })).toBe(true);
+    });
+
+    it('应接受有效的git工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'git', command: 'git status' })).toBe(true);
+    });
+
+    it('应接受有效的glob工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'glob', globPattern: '**/*.ts' })).toBe(true);
+    });
+
+    it('应接受有效的view工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'view', filePath: 'src/app.ts' })).toBe(true);
+    });
+
+    it('应接受有效的view工具调用（含可选字段）', () => {
+      expect(converter.isValidToolCall({ tool: 'view', filePath: 'src/app.ts', lineRange: '10-50', showLineNumbers: true })).toBe(true);
+    });
+
+    it('应接受有效的run_test工具调用（无必填字段）', () => {
+      expect(converter.isValidToolCall({ tool: 'run_test' })).toBe(true);
+    });
+
+    it('应接受有效的run_test工具调用（含可选字段）', () => {
+      expect(converter.isValidToolCall({ tool: 'run_test', testFilter: 'auth.test', testWatch: false })).toBe(true);
+    });
+
+    it('应接受有效的symbol_search工具调用', () => {
+      expect(converter.isValidToolCall({ tool: 'symbol_search', symbolName: 'UserService' })).toBe(true);
+    });
+
+    it('应接受有效的symbol_search工具调用（含可选字段）', () => {
+      expect(converter.isValidToolCall({ tool: 'symbol_search', symbolName: 'UserService', symbolKind: 'class', symbolLimit: 20 })).toBe(true);
+    });
+
+    it('应拒绝非对象输入', () => {
+      expect(converter.isValidToolCall(null)).toBe(false);
+      expect(converter.isValidToolCall(undefined)).toBe(false);
+      expect(converter.isValidToolCall('string')).toBe(false);
+      expect(converter.isValidToolCall(123)).toBe(false);
+    });
+
+    it('应拒绝缺少tool字段的对象', () => {
+      expect(converter.isValidToolCall({ filePath: 'src/app.ts' })).toBe(false);
+    });
+
+    it('应拒绝未知工具类型', () => {
+      expect(converter.isValidToolCall({ tool: 'unknown', filePath: 'src/app.ts' })).toBe(false);
+    });
+
+    it('应拒绝read/edit/write/view缺少filePath', () => {
+      expect(converter.isValidToolCall({ tool: 'read' })).toBe(false);
+      expect(converter.isValidToolCall({ tool: 'edit', search: 'old', replace: 'new' })).toBe(false);
+      expect(converter.isValidToolCall({ tool: 'write', content: 'code' })).toBe(false);
+      expect(converter.isValidToolCall({ tool: 'view', lineRange: '10-50' })).toBe(false);
+    });
+
+    it('应拒绝bash/git缺少command', () => {
+      expect(converter.isValidToolCall({ tool: 'bash' })).toBe(false);
+      expect(converter.isValidToolCall({ tool: 'git' })).toBe(false);
+    });
+
+    it('应拒绝glob缺少globPattern', () => {
+      expect(converter.isValidToolCall({ tool: 'glob' })).toBe(false);
+    });
+
+    it('应拒绝symbol_search缺少symbolName', () => {
+      expect(converter.isValidToolCall({ tool: 'symbol_search' })).toBe(false);
+      expect(converter.isValidToolCall({ tool: 'symbol_search', symbolKind: 'function' })).toBe(false);
+    });
   });
 
   // ---- buildResponse/buildErrorResponse ----

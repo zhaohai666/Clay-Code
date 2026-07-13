@@ -1,5 +1,6 @@
 /**
  * ClayCode 统一日志模块
+ * 基于 winston 日志组件实现
  * 分级滚动日志(Debug/Info/Warn/Error)
  * 日志目录：~/.claycode/logs/
  * 按日期+大小切割，默认最大10MB，每日最多3个备份文件，保留7天
@@ -9,16 +10,18 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import * as zlib from 'zlib';
+import winston from 'winston';
+import DailyRotateFile from 'winston-daily-rotate-file';
 
 /** 日志级别 */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3,
+/** winston 自定义日志级别（数值越小优先级越高） */
+const WINSTON_LEVELS: Record<LogLevel, number> = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3,
 };
 
 /** 终端颜色代码 */
@@ -53,160 +56,98 @@ const DEFAULT_LOG_CONFIG: LogConfig = {
   compressBackups: true,
 };
 
-/** 获取当前日期字符串 YYYYMMDD */
-function getDateString(date: Date = new Date()): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}${m}${d}`;
+/**
+ * 将 LogLevel 映射到 winston 级别字符串
+ * winston npm levels: error=0, warn=1, info=2, verbose=3, debug=4, silly=5
+ * 我们的级别: error=0, warn=1, info=2, debug=3
+ */
+function toWinstonLevel(level: LogLevel): string {
+  return level;
 }
 
-/** 获取当前日志文件路径（按日期命名） */
-function getLogFilePath(date: Date, logDir: string): string {
-  return path.join(logDir, `claycode-${getDateString(date)}.log`);
+/**
+ * 从 winston 级别字符串映射回 LogLevel
+ */
+function fromWinstonLevel(level: string): LogLevel {
+  if (level === 'error' || level === 'warn' || level === 'info' || level === 'debug') {
+    return level as LogLevel;
+  }
+  // winston 内部级别映射到我们的级别
+  if (level === 'silly' || level === 'verbose') return 'debug';
+  return 'info';
 }
 
 export class Logger {
   private minLevel: LogLevel;
-  private fileStream: fs.WriteStream | null = null;
-  private currentFileSize: number = 0;
-  private currentDate: string = '';
   private config: LogConfig;
   private initialized: boolean = false;
+  private winstonLogger: winston.Logger | null = null;
+  private dailyRotateTransport: DailyRotateFile | null = null;
 
   constructor(minLevel: LogLevel = 'info', config?: Partial<LogConfig>) {
     this.minLevel = minLevel;
     this.config = { ...DEFAULT_LOG_CONFIG, ...config };
   }
 
-  /** 初始化日志文件流 */
+  /** 初始化日志（创建 winston logger 实例） */
   init(): void {
     if (this.initialized) return;
+
     if (!fs.existsSync(this.config.logDir)) {
       fs.mkdirSync(this.config.logDir, { recursive: true });
     }
+
+    // 清理过期日志文件
     this.cleanOldLogFiles();
-    this.openStream();
+
+    // 创建 DailyRotateFile transport
+    // 文件命名格式：claycode-YYYYMMDD.log
+    // 超过 maxFileSize 时自动轮转，保留 maxBackupsPerDay 个备份
+    this.dailyRotateTransport = new DailyRotateFile({
+      dirname: this.config.logDir,
+      filename: 'claycode-%DATE%.log',
+      datePattern: 'YYYYMMDD',
+      maxSize: `${this.config.maxFileSize / 1024 / 1024}m`, // 如 '10m'
+      maxFiles: `${this.config.retainDays}d`, // 按天数保留
+      zippedArchive: this.config.compressBackups,
+      extension: '.log',
+      format: winston.format.combine(
+        winston.format.timestamp({ format: 'YYYY-MM-DDTHH:mm:ss.SSSZ' }),
+        winston.format.printf(({ timestamp, level, message, ...meta }) => {
+          const extra = Object.keys(meta).length > 0 ? ' ' + Object.values(meta).join(' ') : '';
+          return `[${timestamp}] [${level.toUpperCase()}] ${message}${extra}`;
+        }),
+      ),
+    });
+
+    // 创建 winston logger
+    this.winstonLogger = winston.createLogger({
+      levels: WINSTON_LEVELS,
+      level: toWinstonLevel(this.minLevel),
+      transports: [
+        // 终端彩色输出
+        new winston.transports.Console({
+          format: winston.format.combine(
+            winston.format.timestamp({ format: 'YYYY-MM-DDTHH:mm:ss.SSSZ' }),
+            winston.format.printf(({ timestamp, level, message, ...meta }) => {
+              const logLevel = fromWinstonLevel(level);
+              const color = COLORS[logLevel] || '';
+              const extra = Object.keys(meta).length > 0 ? ' ' + Object.values(meta).join(' ') : '';
+              return `${color}[${timestamp}] [${level.toUpperCase()}]${RESET} ${message}${extra}`;
+            }),
+          ),
+        }),
+        // 文件持久化（日期+大小滚动）
+        this.dailyRotateTransport,
+      ],
+    });
+
     this.initialized = true;
-  }
-
-  /** 打开日志流 */
-  private openStream(): void {
-    const logFile = getLogFilePath(new Date(), this.config.logDir);
-    this.currentDate = getDateString();
-
-    // 检查现有日志文件大小，决定是否需要轮转
-    if (fs.existsSync(logFile)) {
-      const stat = fs.statSync(logFile);
-      this.currentFileSize = stat.size;
-      if (this.currentFileSize >= this.config.maxFileSize) {
-        this.rotateLog();
-      }
-    } else {
-      this.currentFileSize = 0;
-    }
-    this.fileStream = fs.createWriteStream(logFile, { flags: 'a' });
-  }
-
-  /** 检查日期是否变更，跨日自动切换新日志文件 */
-  private checkDateChange(): void {
-    const today = getDateString();
-    if (this.currentDate !== today) {
-      // 跨日：压缩旧备份文件，关闭旧流，打开新日期的日志文件
-      if (this.config.compressBackups) {
-        this.compressOldBackups(this.currentDate);
-      }
-      if (this.fileStream) {
-        this.fileStream.end();
-        this.fileStream = null;
-      }
-      this.cleanOldLogFiles();
-      this.openStream();
-    }
-  }
-
-  /**
-   * 日志轮转（大小切割）
-   * 支持多级备份：.log → .log.1 → .log.2 → ... → .log.N
-   * 旧备份可选gzip压缩：.log.1.gz, .log.2.gz, ...
-   */
-  private rotateLog(): void {
-    if (this.fileStream) {
-      this.fileStream.end();
-      this.fileStream = null;
-    }
-
-    const logFile = getLogFilePath(new Date(), this.config.logDir);
-    const dateStr = this.currentDate;
-
-    // 移位备份文件：.N → .N+1
-    for (let i = this.config.maxBackupsPerDay - 1; i >= 1; i--) {
-      const olderBackup = `${logFile}.${i}${this.config.compressBackups ? '.gz' : ''}`;
-      const newerBackup = i === 1 ? logFile : `${logFile}.${i - 1}${this.config.compressBackups ? '.gz' : ''}`;
-
-      if (fs.existsSync(olderBackup)) {
-        // 超过最大备份数，删除最旧的
-        if (i === this.config.maxBackupsPerDay - 1) {
-          try { fs.unlinkSync(olderBackup); } catch { /* 忽略 */ }
-          continue;
-        }
-      }
-    }
-
-    // 当前日志 → .1（压缩或直接重命名）
-    if (fs.existsSync(logFile)) {
-      if (this.config.compressBackups) {
-        // 压缩当前日志到 .1.gz
-        const backupGz = `${logFile}.1.gz`;
-        try {
-          const content = fs.readFileSync(logFile);
-          const compressed = zlib.gzipSync(content);
-          fs.writeFileSync(backupGz, compressed);
-          fs.unlinkSync(logFile);
-        } catch (err) {
-          // 压缩失败，直接重命名
-          const backupPlain = `${logFile}.1`;
-          if (fs.existsSync(backupPlain)) { try { fs.unlinkSync(backupPlain); } catch { /* 忽略 */ } }
-          fs.renameSync(logFile, backupPlain);
-        }
-      } else {
-        // 直接重命名
-        const backupFile = `${logFile}.1`;
-        if (fs.existsSync(backupFile)) { try { fs.unlinkSync(backupFile); } catch { /* 忽略 */ } }
-        fs.renameSync(logFile, backupFile);
-      }
-    }
-
-    this.currentFileSize = 0;
-  }
-
-  /**
-   * 压缩指定日期的旧备份文件
-   */
-  private compressOldBackups(dateStr: string): void {
-    const logFile = path.join(this.config.logDir, `claycode-${dateStr}.log`);
-    
-    for (let i = 1; i <= this.config.maxBackupsPerDay; i++) {
-      const plainBackup = `${logFile}.${i}`;
-      const gzBackup = `${logFile}.${i}.gz`;
-      
-      // 如果有未压缩的备份，进行压缩
-      if (fs.existsSync(plainBackup) && !fs.existsSync(gzBackup)) {
-        try {
-          const content = fs.readFileSync(plainBackup);
-          const compressed = zlib.gzipSync(content);
-          fs.writeFileSync(gzBackup, compressed);
-          fs.unlinkSync(plainBackup);
-        } catch {
-          // 压缩失败，保留原文件
-        }
-      }
-    }
   }
 
   /**
    * 清理过期日志文件（超过retainDays天）
-   * 同时清理.log、.log.N、.log.N.gz文件
+   * 同时清理 .log、.log.N、.log.N.gz、.gz 文件
    */
   private cleanOldLogFiles(): void {
     if (!fs.existsSync(this.config.logDir)) return;
@@ -235,18 +176,22 @@ export class Logger {
     }
   }
 
-  /** 关闭日志流 */
+  /** 关闭日志 */
   close(): void {
-    if (this.fileStream) {
-      this.fileStream.end();
-      this.fileStream = null;
+    if (this.winstonLogger) {
+      this.winstonLogger.close();
+      this.winstonLogger = null;
     }
+    this.dailyRotateTransport = null;
     this.initialized = false;
   }
 
   /** 设置日志级别 */
   setLevel(level: LogLevel): void {
     this.minLevel = level;
+    if (this.winstonLogger) {
+      this.winstonLogger.level = toWinstonLevel(level);
+    }
   }
 
   /** 获取当前日志级别 */
@@ -263,9 +208,19 @@ export class Logger {
 
   /**
    * 获取当前日志文件大小(字节)
+   * DailyRotateFile 不直接暴露文件大小，通过文件系统获取
    */
   getCurrentFileSize(): number {
-    return this.currentFileSize;
+    const today = getDateString();
+    const logFile = path.join(this.config.logDir, `claycode-${today}.log`);
+    try {
+      if (fs.existsSync(logFile)) {
+        return fs.statSync(logFile).size;
+      }
+    } catch {
+      // 忽略
+    }
+    return 0;
   }
 
   /**
@@ -297,39 +252,30 @@ export class Logger {
 
   /** 核心日志方法 */
   private log(level: LogLevel, msg: string, ...args: unknown[]): void {
-    if (LOG_LEVEL_PRIORITY[level] < LOG_LEVEL_PRIORITY[this.minLevel]) {
+    // 延迟初始化
+    if (!this.initialized) {
+      this.init();
+    }
+
+    if (WINSTON_LEVELS[level] > WINSTON_LEVELS[this.minLevel]) {
       return;
     }
 
-    const timestamp = new Date().toISOString();
-    const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+    // 将额外参数附加到消息中（兼容原有 API: logger.info('msg', arg1, arg2)）
     const fullMsg = args.length > 0 ? `${msg} ${args.map(String).join(' ')}` : msg;
 
-    // 终端彩色输出
-    const color = COLORS[level];
-    console.log(`${color}${prefix}${RESET} ${fullMsg}`);
-
-    // 文件持久化（无颜色）
-    if (this.fileStream) {
-      // 延迟初始化检查
-      if (!this.initialized) {
-        this.init();
-      }
-
-      // 检查日期变更
-      this.checkDateChange();
-
-      const line = `${prefix} ${fullMsg}\n`;
-      this.fileStream.write(line);
-      this.currentFileSize += Buffer.byteLength(line, 'utf8');
-
-      // 检查是否需要轮转
-      if (this.currentFileSize >= this.config.maxFileSize) {
-        this.rotateLog();
-        this.openStream();
-      }
+    if (this.winstonLogger) {
+      this.winstonLogger.log(toWinstonLevel(level), fullMsg);
     }
   }
+}
+
+/** 获取当前日期字符串 YYYYMMDD */
+function getDateString(date: Date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}${m}${d}`;
 }
 
 /** 全局日志单例 */

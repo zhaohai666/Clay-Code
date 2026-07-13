@@ -223,7 +223,7 @@ export class ProtocolConverter {
     const record = obj as Record<string, unknown>;
     if (typeof record['tool'] !== 'string') return false;
 
-    const validTools: ToolType[] = ['read', 'edit', 'write', 'bash', 'git', 'glob'];
+    const validTools: ToolType[] = ['read', 'edit', 'write', 'bash', 'git', 'glob', 'view', 'run_test', 'symbol_search'];
     if (!validTools.includes(record['tool'] as ToolType)) return false;
 
     const tool = record['tool'] as ToolType;
@@ -231,12 +231,18 @@ export class ProtocolConverter {
       case 'read':
       case 'edit':
       case 'write':
+      case 'view':
         return typeof record['filePath'] === 'string';
       case 'bash':
       case 'git':
         return typeof record['command'] === 'string';
       case 'glob':
         return typeof record['globPattern'] === 'string';
+      case 'run_test':
+        // testFilter 可选，无必填字段
+        return true;
+      case 'symbol_search':
+        return typeof record['symbolName'] === 'string';
       default:
         return false;
     }
