@@ -212,6 +212,7 @@ export class ConfigManager {
       metricsPort: override.metricsPort ?? base.metricsPort,
       apiKey: override.apiKey ?? base.apiKey,
       proxyUrl: override.proxyUrl ?? base.proxyUrl,
+      requireChangeReview: override.requireChangeReview ?? base.requireChangeReview,
     };
   }
 }

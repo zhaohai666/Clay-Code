@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
-import { SessionState, ChatMessage, AdapterType, ErrorCode } from '../types';
+import { SessionState, ChatMessage, AdapterType, ErrorCode, Checkpoint, ToolCall, ExecuteResult, Workspace } from '../types';
 import { ensureDir, logger } from '../utils';
 import { SecurityManager } from './security';
 
@@ -202,6 +202,247 @@ export class SessionManager {
     for (const [, session] of this.sessions) {
       this.saveSession(session);
     }
+  }
+
+  // ---- 检查点管理 ----
+
+  /** 创建检查点（每轮工具执行后调用） */
+  createCheckpoint(
+    toolCalls: ToolCall[],
+    executeResults: ExecuteResult[],
+    label?: string
+  ): Checkpoint | null {
+    const session = this.getActiveSession();
+    if (!session) {
+      logger.warn('[SessionManager] 无活跃会话，无法创建检查点');
+      return null;
+    }
+    if (!session.checkpoints) {
+      session.checkpoints = [];
+    }
+    const checkpoint: Checkpoint = {
+      id: crypto.randomUUID(),
+      sessionId: session.sessionId,
+      timestamp: Date.now(),
+      roundIndex: session.checkpoints.length,
+      toolCalls,
+      executeResults,
+      messageCount: session.messages.length,
+      fileChangeCount: session.fileChanges?.length ?? 0,
+      label,
+    };
+    session.checkpoints.push(checkpoint);
+    this.saveSession(session);
+    logger.info(
+      `[SessionManager] 创建检查点: round=${checkpoint.roundIndex}, id=${checkpoint.id.slice(0, 8)}${label ? `, label="${label}"` : ''}`
+    );
+    return checkpoint;
+  }
+
+  /** 恢复到指定检查点（断点续跑） */
+  restoreCheckpoint(checkpointId: string): SessionState | null {
+    const session = this.getActiveSession();
+    if (!session) {
+      logger.warn('[SessionManager] 无活跃会话，无法恢复检查点');
+      return null;
+    }
+    if (!session.checkpoints || session.checkpoints.length === 0) {
+      logger.warn('[SessionManager] 当前会话无检查点');
+      return null;
+    }
+    const idx = session.checkpoints.findIndex((cp) => cp.id === checkpointId);
+    if (idx === -1) {
+      logger.warn(`[SessionManager] 检查点不存在: ${checkpointId}`);
+      return null;
+    }
+    // 截断检查点列表至目标位置（丢弃目标之后的检查点）
+    session.checkpoints = session.checkpoints.slice(0, idx + 1);
+    // 截断消息至检查点时的数量
+    if (session.messages.length > session.checkpoints[idx].messageCount) {
+      session.messages = session.messages.slice(0, session.checkpoints[idx].messageCount);
+    }
+    // 截断文件变更记录至检查点时的数量
+    if (session.fileChanges && session.fileChanges.length > session.checkpoints[idx].fileChangeCount) {
+      session.fileChanges = session.fileChanges.slice(0, session.checkpoints[idx].fileChangeCount);
+    }
+    session.lastActiveAt = Date.now();
+    this.saveSession(session);
+    logger.info(
+      `[SessionManager] 恢复检查点: round=${session.checkpoints[idx].roundIndex}, id=${checkpointId.slice(0, 8)}`
+    );
+    return session;
+  }
+
+  /** 列出当前会话的所有检查点 */
+  listCheckpoints(): Checkpoint[] {
+    const session = this.getActiveSession();
+    if (!session || !session.checkpoints) return [];
+    return [...session.checkpoints];
+  }
+
+  /** 获取指定检查点 */
+  getCheckpoint(checkpointId: string): Checkpoint | null {
+    const session = this.getActiveSession();
+    if (!session || !session.checkpoints) return null;
+    return session.checkpoints.find((cp) => cp.id === checkpointId) ?? null;
+  }
+
+  /** 获取最近的检查点（用于断点续跑恢复） */
+  getLatestCheckpoint(): Checkpoint | null {
+    const session = this.getActiveSession();
+    if (!session || !session.checkpoints || session.checkpoints.length === 0) return null;
+    return session.checkpoints[session.checkpoints.length - 1];
+  }
+
+  /** 删除指定检查点 */
+  deleteCheckpoint(checkpointId: string): boolean {
+    const session = this.getActiveSession();
+    if (!session || !session.checkpoints) return false;
+    const idx = session.checkpoints.findIndex((cp) => cp.id === checkpointId);
+    if (idx === -1) return false;
+    session.checkpoints.splice(idx, 1);
+    // 重新编号roundIndex
+    session.checkpoints.forEach((cp, i) => {
+      cp.roundIndex = i;
+    });
+    this.saveSession(session);
+    logger.info(`[SessionManager] 删除检查点: ${checkpointId.slice(0, 8)}`);
+    return true;
+  }
+
+  /** 清除当前会话所有检查点 */
+  clearCheckpoints(): void {
+    const session = this.getActiveSession();
+    if (!session) return;
+    session.checkpoints = [];
+    this.saveSession(session);
+    logger.info('[SessionManager] 已清除所有检查点');
+  }
+
+  /** 从检查点恢复会话（按会话ID+检查点ID，用于非活跃会话恢复） */
+  restoreSessionCheckpoint(sessionId: string, checkpointId: string): SessionState | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      logger.warn(`[SessionManager] 会话不存在: ${sessionId}`);
+      return null;
+    }
+    this.activeSessionId = sessionId;
+    return this.restoreCheckpoint(checkpointId);
+  }
+
+  /** 获取检查点摘要信息（用于CLI展示） */
+  getCheckpointSummary(): string {
+    const checkpoints = this.listCheckpoints();
+    if (checkpoints.length === 0) return '当前会话无检查点';
+    const lines = checkpoints.map((cp) => {
+      const time = new Date(cp.timestamp).toLocaleString();
+      const toolNames = cp.toolCalls.map((tc) => tc.tool).join(', ');
+      const label = cp.label ? ` [${cp.label}]` : '';
+      return `  #${cp.roundIndex} | ${time} | tools: ${toolNames} | msgs: ${cp.messageCount}${label}`;
+    });
+    return `检查点列表 (${checkpoints.length}个):\n${lines.join('\n')}`;
+  }
+
+  // ---- 工作区管理 (V1.2: 多工作区分隔) ----
+
+  /** 创建新工作区 */
+  createWorkspace(name: string, projectPath: string): Workspace | null {
+    const session = this.getActiveSession();
+    if (!session) {
+      logger.warn('[SessionManager] 无活跃会话，无法创建工作区');
+      return null;
+    }
+    if (!session.workspaces) {
+      session.workspaces = [];
+    }
+    // 将现有活跃工作区设为非活跃
+    for (const ws of session.workspaces) {
+      ws.active = false;
+    }
+    const workspace: Workspace = {
+      id: crypto.randomUUID(),
+      name,
+      projectPath,
+      createdAt: Date.now(),
+      lastActiveAt: Date.now(),
+      active: true,
+    };
+    session.workspaces.push(workspace);
+    session.activeWorkspaceId = workspace.id;
+    // 同步更新会话的projectPath
+    session.projectPath = projectPath;
+    this.saveSession(session);
+    logger.info(`[SessionManager] 创建工作区: ${name} (${workspace.id.slice(0, 8)}), 路径: ${projectPath}`);
+    return workspace;
+  }
+
+  /** 切换到指定工作区 */
+  switchWorkspace(workspaceId: string): Workspace | null {
+    const session = this.getActiveSession();
+    if (!session || !session.workspaces) return null;
+    const workspace = session.workspaces.find((ws) => ws.id === workspaceId);
+    if (!workspace) {
+      logger.warn(`[SessionManager] 工作区不存在: ${workspaceId}`);
+      return null;
+    }
+    // 将所有工作区设为非活跃
+    for (const ws of session.workspaces) {
+      ws.active = false;
+    }
+    workspace.active = true;
+    workspace.lastActiveAt = Date.now();
+    session.activeWorkspaceId = workspace.id;
+    session.projectPath = workspace.projectPath;
+    this.saveSession(session);
+    logger.info(`[SessionManager] 切换到工作区: ${workspace.name} (${workspace.id.slice(0, 8)})`);
+    return workspace;
+  }
+
+  /** 获取当前活跃工作区 */
+  getActiveWorkspace(): Workspace | null {
+    const session = this.getActiveSession();
+    if (!session || !session.workspaces) return null;
+    return session.workspaces.find((ws) => ws.active) ?? null;
+  }
+
+  /** 列出所有工作区 */
+  listWorkspaces(): Workspace[] {
+    const session = this.getActiveSession();
+    if (!session || !session.workspaces) return [];
+    return [...session.workspaces];
+  }
+
+  /** 删除指定工作区 */
+  deleteWorkspace(workspaceId: string): boolean {
+    const session = this.getActiveSession();
+    if (!session || !session.workspaces) return false;
+    const idx = session.workspaces.findIndex((ws) => ws.id === workspaceId);
+    if (idx === -1) return false;
+    const wasActive = session.workspaces[idx].active;
+    session.workspaces.splice(idx, 1);
+    // 如果删除的是活跃工作区，切换到第一个
+    if (wasActive && session.workspaces.length > 0) {
+      session.workspaces[0].active = true;
+      session.activeWorkspaceId = session.workspaces[0].id;
+      session.projectPath = session.workspaces[0].projectPath;
+    } else if (session.workspaces.length === 0) {
+      session.activeWorkspaceId = undefined;
+    }
+    this.saveSession(session);
+    logger.info(`[SessionManager] 删除工作区: ${workspaceId.slice(0, 8)}`);
+    return true;
+  }
+
+  /** 获取工作区摘要信息 */
+  getWorkspaceSummary(): string {
+    const workspaces = this.listWorkspaces();
+    if (workspaces.length === 0) return '当前会话无工作区';
+    const lines = workspaces.map((ws) => {
+      const active = ws.active ? ' *' : '';
+      const time = new Date(ws.lastActiveAt).toLocaleString();
+      return `  ${ws.name}${active} | ${ws.projectPath} | ${time}`;
+    });
+    return `工作区列表 (${workspaces.length}个):\n${lines.join('\n')}`;
   }
 
   // ---- 私有方法 ----

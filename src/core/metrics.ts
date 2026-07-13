@@ -32,7 +32,7 @@ export class MetricsCollector {
 
   // ---- 指标存储 ----
   private aiLatencies: number[] = [];
-  private fileOperations = { read: 0, write: 0, edit: 0, bash: 0 };
+  private fileOperations = { read: 0, write: 0, edit: 0, bash: 0, git: 0 };
   private commandResults = { success: 0, failed: 0 };
   private browserRestarts = 0;
   private startTime: number;
@@ -117,7 +117,7 @@ export class MetricsCollector {
   }
 
   /** 记录文件操作 */
-  recordFileOperation(type: 'read' | 'write' | 'edit' | 'bash'): void {
+  recordFileOperation(type: 'read' | 'write' | 'edit' | 'bash' | 'git'): void {
     if (!this.enabled) return;
     this.fileOperations[type]++;
   }
@@ -153,6 +153,9 @@ export class MetricsCollector {
       memoryUsageMB: Math.round(memUsage.heapUsed / 1024 / 1024),
       fileOpsRead: this.fileOperations.read,
       fileOpsWrite: this.fileOperations.write,
+      fileOpsEdit: this.fileOperations.edit,
+      fileOpsBash: this.fileOperations.bash,
+      fileOpsGit: this.fileOperations.git,
       commandSuccessRate: totalCmd > 0 ? this.commandResults.success / totalCmd : 1,
       browserRestarts: this.browserRestarts,
     };
@@ -226,7 +229,7 @@ export class MetricsCollector {
   /** 重置所有指标 */
   reset(): void {
     this.aiLatencies = [];
-    this.fileOperations = { read: 0, write: 0, edit: 0, bash: 0 };
+    this.fileOperations = { read: 0, write: 0, edit: 0, bash: 0, git: 0 };
     this.commandResults = { success: 0, failed: 0 };
     this.browserRestarts = 0;
     this.startTime = Date.now();

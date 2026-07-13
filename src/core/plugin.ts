@@ -46,6 +46,12 @@ export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginsDir: string;
   private initialized: boolean = false;
+  /** 文件修改时间记录（用于热重载变更检测） */
+  private pluginMtimes: Map<string, number> = new Map();
+  /** 文件监听器 */
+  private watcher: fs.FSWatcher | null = null;
+  /** 防抖定时器 */
+  private reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(pluginsDir?: string) {
     this.pluginsDir = pluginsDir ?? path.join(process.env.HOME ?? '~', '.claycode', 'plugins');
@@ -79,6 +85,7 @@ export class PluginManager {
     }
 
     logger.info(`[PluginManager] 加载完成: ${result.loaded}成功, ${result.failed}失败`);
+    this.recordMtimes();
     return result;
   }
 
@@ -280,5 +287,215 @@ export class PluginManager {
   /** 是否已初始化 */
   isInitialized(): boolean {
     return this.initialized;
+  }
+
+  // ---- 热重载（README 2.3.2） ----
+
+  /** 重新加载指定插件（卸载→清缓存→重新加载） */
+  async reloadPlugin(name: string): Promise<PluginInstance | null> {
+    const plugin = this.plugins.get(name);
+    if (!plugin) {
+      logger.warn(`[PluginManager] 热重载失败: 插件 ${name} 未加载`);
+      return null;
+    }
+
+    const pluginDir = path.dirname(path.join(this.pluginsDir, plugin.descriptor.name));
+    const descriptorDir = this.findPluginDir(name);
+
+    // 1. 调用destroy钩子
+    if (plugin.hooks.destroy) {
+      try {
+        await plugin.hooks.destroy();
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(`[PluginManager] 热重载: 插件 ${name} destroy失败: ${message}`);
+      }
+    }
+
+    // 2. 从映射中移除
+    this.plugins.delete(name);
+
+    // 3. 清除Node.js模块缓存
+    this.invalidateModuleCache(name);
+
+    // 4. 重新加载
+    if (descriptorDir) {
+      try {
+        const instance = await this.loadPlugin(descriptorDir);
+        if (this.initialized && instance.hooks.setup) {
+          await instance.hooks.setup(instance.descriptor);
+          instance.state = 'active';
+        }
+        logger.info(`[PluginManager] 插件热重载成功: ${name}`);
+        return instance;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(`[PluginManager] 插件热重载失败 ${name}: ${message}`);
+        return null;
+      }
+    }
+
+    logger.warn(`[PluginManager] 热重载失败: 找不到插件 ${name} 的目录`);
+    return null;
+  }
+
+  /** 扫描插件目录，热重载已变更的插件、加载新增插件 */
+  async hotReload(): Promise<{ reloaded: string[]; added: string[]; removed: string[]; errors: string[] }> {
+    const result = { reloaded: [] as string[], added: [] as string[], removed: [] as string[], errors: [] as string[] };
+
+    if (!fs.existsSync(this.pluginsDir)) {
+      return result;
+    }
+
+    // 1. 检测已变更的插件（通过plugin.json修改时间）
+    const currentPlugins = new Set<string>();
+    const entries = fs.readdirSync(this.pluginsDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const pluginDir = path.join(this.pluginsDir, entry.name);
+      const descriptorPath = path.join(pluginDir, 'plugin.json');
+
+      if (!fs.existsSync(descriptorPath)) continue;
+
+      currentPlugins.add(entry.name);
+      const stat = fs.statSync(descriptorPath);
+      const mtime = stat.mtimeMs;
+      const prevMtime = this.pluginMtimes.get(entry.name);
+
+      if (this.plugins.has(entry.name)) {
+        // 已加载的插件：检查是否变更
+        if (prevMtime !== undefined && mtime > prevMtime) {
+          const instance = await this.reloadPlugin(entry.name);
+          if (instance) {
+            result.reloaded.push(entry.name);
+            this.pluginMtimes.set(entry.name, mtime);
+          } else {
+            result.errors.push(entry.name);
+          }
+        }
+      } else {
+        // 新增插件
+        try {
+          await this.loadPlugin(pluginDir);
+          if (this.initialized) {
+            const plugin = this.plugins.get(entry.name);
+            if (plugin?.hooks.setup) {
+              await plugin.hooks.setup(plugin.descriptor);
+              plugin.state = 'active';
+            } else if (plugin) {
+              plugin.state = 'active';
+            }
+          }
+          result.added.push(entry.name);
+          this.pluginMtimes.set(entry.name, mtime);
+          logger.info(`[PluginManager] 热重载: 新增插件 ${entry.name}`);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          result.errors.push(`${entry.name}: ${message}`);
+        }
+      }
+    }
+
+    // 2. 检测已删除的插件
+    for (const name of this.plugins.keys()) {
+      if (!currentPlugins.has(name)) {
+        await this.unloadPlugin(name);
+        result.removed.push(name);
+        this.pluginMtimes.delete(name);
+        logger.info(`[PluginManager] 热重载: 移除插件 ${name}`);
+      }
+    }
+
+    if (result.reloaded.length + result.added.length + result.removed.length > 0) {
+      logger.info(`[PluginManager] 热重载完成: ${result.reloaded.length}重载, ${result.added.length}新增, ${result.removed.length}移除`);
+    }
+
+    return result;
+  }
+
+  /** 启动插件目录文件监听（自动热重载） */
+  watchPlugins(): void {
+    if (this.watcher) {
+      logger.warn('[PluginManager] 文件监听已在运行');
+      return;
+    }
+
+    if (!fs.existsSync(this.pluginsDir)) {
+      fs.mkdirSync(this.pluginsDir, { recursive: true });
+    }
+
+    this.watcher = fs.watch(this.pluginsDir, { recursive: true }, (eventType, filename) => {
+      if (!filename) return;
+
+      // 只关注plugin.json和.js/.ts文件变更
+      if (filename.endsWith('plugin.json') || filename.endsWith('.js') || filename.endsWith('.ts')) {
+        logger.debug(`[PluginManager] 检测到文件变更: ${filename}`);
+
+        // 防抖：500ms内多次变更只触发一次
+        if (this.reloadTimer) {
+          clearTimeout(this.reloadTimer);
+        }
+        this.reloadTimer = setTimeout(() => {
+          this.hotReload().catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error(`[PluginManager] 自动热重载失败: ${message}`);
+          });
+          this.reloadTimer = null;
+        }, 500);
+      }
+    });
+
+    logger.info(`[PluginManager] 已启动插件目录监听: ${this.pluginsDir}`);
+  }
+
+  /** 停止插件目录文件监听 */
+  stopWatching(): void {
+    if (this.reloadTimer) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+      logger.info('[PluginManager] 已停止插件目录监听');
+    }
+  }
+
+  /** 查找插件目录路径 */
+  private findPluginDir(name: string): string | null {
+    const pluginDir = path.join(this.pluginsDir, name);
+    if (fs.existsSync(pluginDir) && fs.existsSync(path.join(pluginDir, 'plugin.json'))) {
+      return pluginDir;
+    }
+    return null;
+  }
+
+  /** 清除插件的Node.js模块缓存 */
+  private invalidateModuleCache(name: string): void {
+    const plugin = this.plugins.get(name);
+    if (!plugin) return;
+
+    const entryPath = path.join(this.pluginsDir, plugin.descriptor.name, plugin.descriptor.main);
+
+    // 清除require缓存中与该插件相关的所有模块
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(this.pluginsDir)) {
+        delete require.cache[key];
+      }
+    }
+
+    logger.debug(`[PluginManager] 已清除插件 ${name} 的模块缓存`);
+  }
+
+  /** 记录所有已加载插件的修改时间（用于后续变更检测） */
+  recordMtimes(): void {
+    for (const [name, plugin] of this.plugins) {
+      const descriptorPath = path.join(this.pluginsDir, plugin.descriptor.name, 'plugin.json');
+      if (fs.existsSync(descriptorPath)) {
+        const stat = fs.statSync(descriptorPath);
+        this.pluginMtimes.set(name, stat.mtimeMs);
+      }
+    }
   }
 }

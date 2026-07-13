@@ -60,6 +60,8 @@ export interface GlobalConfig {
   apiKey: string;
   /** 代理URL（可包含认证信息，AES加密存储） */
   proxyUrl: string;
+  /** V1.1: 是否启用文件变更Diff交互式预审确认 */
+  requireChangeReview: boolean;
 }
 
 /** 默认全局配置 */
@@ -86,6 +88,7 @@ export const DEFAULT_CONFIG: GlobalConfig = {
   metricsPort: 0,
   apiKey: '',
   proxyUrl: '',
+  requireChangeReview: false,
 };
 
 // ============================================================
@@ -99,6 +102,46 @@ export type MessageRole = 'user' | 'ai' | 'system';
 export interface ChatMessage {
   role: MessageRole;
   content: string;
+}
+
+/** V1.2: 任务检查点 - 每轮工具执行后持久化执行现场，支持断点续跑 */
+export interface Checkpoint {
+  /** 检查点唯一ID */
+  id: string;
+  /** 所属会话ID */
+  sessionId: string;
+  /** 检查点创建时间戳 */
+  timestamp: number;
+  /** 执行轮次索引（从0开始） */
+  roundIndex: number;
+  /** 本轮工具调用列表 */
+  toolCalls: ToolCall[];
+  /** 本轮执行结果列表（与toolCalls一一对应） */
+  executeResults: ExecuteResult[];
+  /** 检查点时的消息快照（消息摘要，非全量） */
+  messageCount: number;
+  /** 检查点时的文件变更记录快照 */
+  fileChangeCount: number;
+  /** 用户自定义标签（可选） */
+  label?: string;
+}
+
+/** V1.2: 工作区 - 会话多工作区分隔支持 */
+export interface Workspace {
+  /** 工作区唯一ID */
+  id: string;
+  /** 工作区名称 */
+  name: string;
+  /** 工作区项目根目录 */
+  projectPath: string;
+  /** 工作区文件变更记录（独立于会话级别） */
+  fileChanges?: FileChangeRecord[];
+  /** 工作区创建时间 */
+  createdAt: number;
+  /** 工作区最后活跃时间 */
+  lastActiveAt: number;
+  /** 是否为当前活跃工作区 */
+  active: boolean;
 }
 
 /** 会话状态 */
@@ -117,6 +160,14 @@ export interface SessionState {
   createdAt: number;
   /** 最后活跃时间 */
   lastActiveAt: number;
+  /** 会话文件变更记录 */
+  fileChanges?: FileChangeRecord[];
+  /** V1.2: 任务检查点列表（断点续跑） */
+  checkpoints?: Checkpoint[];
+  /** V1.2: 多工作区列表 */
+  workspaces?: Workspace[];
+  /** V1.2: 当前活跃工作区ID */
+  activeWorkspaceId?: string;
 }
 
 // ============================================================
@@ -137,9 +188,39 @@ export interface ExecuteResult {
   diffPatch?: string;
   /** 操作涉及的文件列表 */
   operateFiles: string[];
+  /** 文件变更记录（Git操作时自动同步至AI上下文） */
+  fileChanges?: FileChangeRecord[];
 }
 
 /** AI任务请求结构体 */
+/** V1.1: 任务规划结构 (README 3.3节) */
+export interface TaskPlan {
+  /** 任务摘要 */
+  summary: string;
+  /** 子任务列表 */
+  subTasks: TaskPlanSubTask[];
+  /** 规划创建时间 */
+  createdAt: string;
+  /** 规划状态: pending(待确认)/active(执行中)/completed(已完成)/cancelled(已取消) */
+  status: 'pending' | 'active' | 'completed' | 'cancelled';
+}
+
+/** V1.1: 任务规划子任务 */
+export interface TaskPlanSubTask {
+  /** 子任务ID */
+  id: string;
+  /** 子任务标题 */
+  title: string;
+  /** 子任务描述 */
+  description?: string;
+  /** 是否已完成 */
+  finished: boolean;
+  /** 依赖的子任务ID列表 */
+  depends?: string[];
+  /** 预计工具调用 */
+  estimatedTools?: ToolType[];
+}
+
 export interface TaskRequest {
   /** 用户原始需求 */
   userPrompt: string;
@@ -151,18 +232,20 @@ export interface TaskRequest {
   sessionHistory: ChatMessage[];
   /** 上一轮本地执行日志 */
   lastExecuteOutput?: ExecuteResult;
+  /** V1.1: 当前任务规划 */
+  taskPlan?: TaskPlan;
   /** 全局配置（可选） */
   config?: GlobalConfig;
 }
 
 /** 标准化工具调用类型 */
-export type ToolType = 'read' | 'edit' | 'write' | 'bash' | 'git' | 'glob';
+export type ToolType = 'read' | 'edit' | 'write' | 'bash' | 'git' | 'glob' | 'view' | 'run_test' | 'symbol_search';
 
 /** 标准化工具调用指令 */
 export interface ToolCall {
   /** 工具类型 */
   tool: ToolType;
-  /** 文件路径 (read/edit/write) */
+  /** 文件路径 (read/edit/write/view) */
   filePath?: string;
   /** 文件内容 (write) */
   content?: string;
@@ -172,6 +255,20 @@ export interface ToolCall {
   command?: string;
   /** Glob匹配模式 (glob) */
   globPattern?: string;
+  /** V1.2: 行范围 (view) "start-end" 格式，如 "10-50" */
+  lineRange?: string;
+  /** V1.2: 是否显示行号 (view)，默认true */
+  showLineNumbers?: boolean;
+  /** V1.2: 测试过滤模式 (run_test)，如 "test-file" 或 "test-name" */
+  testFilter?: string;
+  /** V1.2: 是否监听模式 (run_test)，默认false */
+  testWatch?: boolean;
+  /** V1.2: 符号搜索名称 (symbol_search)，精确或模糊匹配 */
+  symbolName?: string;
+  /** V1.2: 符号类型过滤 (symbol_search)，如 "class"、"function"、"interface" */
+  symbolKind?: string;
+  /** V1.2: 搜索结果上限 (symbol_search)，默认20 */
+  symbolLimit?: number;
 }
 
 /** AI任务响应结构体 */
@@ -185,6 +282,8 @@ export interface TaskResponse {
     toolCalls: ToolCall[];
     /** 追加到对话上下文的消息 */
     appendChatMsg: ChatMessage;
+    /** V1.1: 任务规划（复杂需求自动生成） */
+    taskPlan?: TaskPlan;
   };
 }
 
@@ -320,6 +419,44 @@ export interface PluginInstance {
 }
 
 // ============================================================
+// 插件市场类型（V1.1）
+// ============================================================
+
+/** 插件市场条目 */
+export interface PluginMarketEntry {
+  /** 插件名称 */
+  name: string;
+  /** 插件版本 */
+  version: string;
+  /** 插件类型 */
+  type: PluginType;
+  /** 插件描述 */
+  description: string;
+  /** 作者 */
+  author: string;
+  /** 下载URL或本地路径 */
+  sourceUrl: string;
+  /** 标签 */
+  tags: string[];
+  /** 下载次数 */
+  downloads: number;
+  /** 发布时间 */
+  publishedAt: number;
+  /** 更新时间 */
+  updatedAt: number;
+}
+
+/** 插件市场搜索结果 */
+export interface PluginMarketSearchResult {
+  /** 搜索结果条目 */
+  entries: PluginMarketEntry[];
+  /** 搜索关键词 */
+  keyword: string;
+  /** 结果总数 */
+  total: number;
+}
+
+// ============================================================
 // 缓存类型
 // ============================================================
 
@@ -351,6 +488,12 @@ export interface MetricsData {
   fileOpsRead: number;
   /** 文件写入次数 */
   fileOpsWrite: number;
+  /** 文件编辑次数 */
+  fileOpsEdit: number;
+  /** Bash命令执行次数 */
+  fileOpsBash: number;
+  /** Git操作次数 */
+  fileOpsGit: number;
   /** 命令执行成功率 */
   commandSuccessRate: number;
   /** Chrome浏览器重启次数 */
@@ -401,4 +544,86 @@ export interface ErrorGuide {
   fixSuggestion: string;
   /** 一键修复命令 */
   fixCommand?: string;
+}
+
+// ============================================================
+// V1.2 Web管理面板类型
+// ============================================================
+
+/** Web面板配置 */
+export interface WebPanelOptions {
+  /** HTTP端口，默认18080 */
+  port?: number;
+  /** 绑定主机，默认localhost */
+  host?: string;
+  /** 是否自动打开浏览器 */
+  openBrowser?: boolean;
+}
+
+/** Web面板API响应基类 */
+export interface WebPanelApiResponse<T = unknown> {
+  /** 是否成功 */
+  success: boolean;
+  /** 消息 */
+  message?: string;
+  /** 数据 */
+  data?: T;
+}
+
+/** 会话摘要（Web面板用） */
+export interface SessionSummary {
+  /** 会话ID */
+  sessionId: string;
+  /** 会话名称 */
+  sessionName: string;
+  /** 适配器类型 */
+  adapter: AdapterType;
+  /** 消息数量 */
+  messageCount: number;
+  /** 创建时间 */
+  createdAt: number;
+  /** 最后活跃时间 */
+  lastActiveAt: number;
+  /** 最后消息预览 */
+  lastMessagePreview: string;
+}
+
+// ============================================================
+// V1.2 批量导出Markdown报告类型
+// ============================================================
+
+/** 报告导出选项 */
+export interface ReportExportOptions {
+  /** 输出目录，默认当前目录 */
+  outputDir?: string;
+  /** 报告标题 */
+  title?: string;
+  /** 是否包含完整对话记录，默认true */
+  includeChatHistory?: boolean;
+  /** 是否包含文件变更记录，默认true */
+  includeFileChanges?: boolean;
+  /** 是否包含执行统计，默认true */
+  includeMetrics?: boolean;
+  /** 会话ID（指定导出单个会话） */
+  sessionId?: string;
+  /** 时间范围起始（毫秒时间戳） */
+  fromTime?: number;
+  /** 时间范围结束（毫秒时间戳） */
+  toTime?: number;
+}
+
+/** 报告导出结果 */
+export interface ReportExportResult {
+  /** 是否成功 */
+  success: boolean;
+  /** 输出文件路径 */
+  filePath?: string;
+  /** 消息 */
+  message: string;
+  /** 包含的会话数 */
+  sessionCount: number;
+  /** 包含的文件变更数 */
+  fileChangeCount: number;
+  /** 报告生成时间 */
+  generatedAt: number;
 }

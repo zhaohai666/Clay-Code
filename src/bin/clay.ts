@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * ClayCode CLI 入口
- * clay agent/chat/login/config/session/log/doctor/plugin
+ * clay agent/chat/login/config/session/log/doctor/plugin/watch
  */
 
 import { Command } from 'commander';
@@ -9,7 +9,11 @@ import { ClayCodeEngine } from '../core/index';
 import { ConfigManager } from '../core/config';
 import { SessionManager } from '../core/session';
 import { PluginManager } from '../core/plugin';
+import { PluginMarketManager } from '../core/plugin-market';
 import { MetricsCollector } from '../core/metrics';
+import { WebPanelManager } from '../core/web-panel';
+import { ReportExporter } from '../core/report';
+import { FileWatcher } from '../core/watcher';
 import { logger, LogLevel } from '../utils';
 import { CommandHistory } from '../utils/history';
 import * as fs from 'fs';
@@ -328,6 +332,192 @@ sessionCmd
     console.log(`✅ 会话 ${sessionId} 已删除`);
   });
 
+// ---- clay session checkpoint (V1.2) ----
+const checkpointCmd = sessionCmd
+  .command('checkpoint')
+  .description('管理会话检查点');
+
+checkpointCmd
+  .command('list')
+  .description('列出当前会话的检查点')
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((opts: { session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const summary = sm.getCheckpointSummary();
+    if (!summary) {
+      console.log('暂无检查点');
+      return;
+    }
+    console.log('\n📋 检查点列表:\n');
+    console.log(summary);
+  });
+
+checkpointCmd
+  .command('restore')
+  .description('从检查点恢复会话')
+  .argument('<checkpoint-id>', '检查点ID')
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((checkpointId: string, opts: { session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const restored = sm.restoreSessionCheckpoint(
+      sm.getActiveSession()?.sessionId || '',
+      checkpointId,
+    );
+    if (restored) {
+      sm.persistSession(restored.sessionId);
+      console.log(`✅ 已从检查点 ${checkpointId} 恢复会话`);
+      console.log(`   消息数: ${restored.messages.length}, 检查点数: ${restored.checkpoints?.length || 0}`);
+    } else {
+      console.log(`❌ 检查点不存在或恢复失败: ${checkpointId}`);
+    }
+  });
+
+// ---- clay session workspace (V1.2) ----
+const workspaceCmd = sessionCmd
+  .command('workspace')
+  .description('管理工作区');
+
+workspaceCmd
+  .command('new')
+  .description('创建新工作区')
+  .argument('<name>', '工作区名称')
+  .option('-p, --path <path>', '项目路径', process.cwd())
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((name: string, opts: { path: string; session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const workspace = sm.createWorkspace(name, opts.path);
+    if (workspace) {
+      console.log(`✅ 已创建工作区: ${workspace.name} (${workspace.id})`);
+      console.log(`   项目路径: ${workspace.projectPath}`);
+    } else {
+      console.log('❌ 创建工作区失败（无活跃会话）');
+    }
+  });
+
+workspaceCmd
+  .command('switch')
+  .description('切换到指定工作区')
+  .argument('<workspace-id>', '工作区ID')
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((workspaceId: string, opts: { session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const workspace = sm.switchWorkspace(workspaceId);
+    if (workspace) {
+      console.log(`✅ 已切换到工作区: ${workspace.name} (${workspace.id})`);
+      console.log(`   项目路径: ${workspace.projectPath}`);
+    } else {
+      console.log(`❌ 工作区不存在: ${workspaceId}`);
+    }
+  });
+
+workspaceCmd
+  .command('list')
+  .description('列出所有工作区')
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((opts: { session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const summary = sm.getWorkspaceSummary();
+    if (!summary) {
+      console.log('暂无工作区');
+      return;
+    }
+    console.log('\n📋 工作区列表:\n');
+    console.log(summary);
+  });
+
+workspaceCmd
+  .command('delete')
+  .description('删除指定工作区')
+  .argument('<workspace-id>', '工作区ID')
+  .option('-s, --session <id>', '会话ID或名称')
+  .action((workspaceId: string, opts: { session?: string }) => {
+    const cm = new ConfigManager();
+    const sm = new SessionManager(cm.getSessionDir());
+    sm.init();
+
+    const sessionId = opts.session;
+    if (sessionId) {
+      const session = sm.getSession(sessionId);
+      if (!session) {
+        console.log(`❌ 会话不存在: ${sessionId}`);
+        return;
+      }
+      sm.useSession(session.sessionId);
+    }
+
+    const deleted = sm.deleteWorkspace(workspaceId);
+    if (deleted) {
+      console.log(`✅ 工作区 ${workspaceId} 已删除`);
+    } else {
+      console.log(`❌ 工作区不存在: ${workspaceId}`);
+    }
+  });
+
 // ---- clay log ----
 program
   .command('log')
@@ -371,6 +561,52 @@ program
 
     const tailLines = allLines.slice(-lineCount);
     console.log(tailLines.join('\n'));
+  });
+
+// ---- clay watch (V1.2) ----
+program
+  .command('watch')
+  .description('开启文件变更监听会话')
+  .option('-d, --debounce <ms>', '防抖间隔(毫秒)', '300')
+  .option('-i, --idle <ms>', '闲置超时(毫秒)', '1800000')
+  .option('-r, --recursive', '递归监听子目录', true)
+  .action(async (opts: { debounce: string; idle: string; recursive: boolean }) => {
+    const projectRoot = process.cwd();
+    const debounceMs = parseInt(opts.debounce, 10) || 300;
+    const idleTimeoutMs = parseInt(opts.idle, 10) || 30 * 60 * 1000;
+
+    console.log(`\n👁️ ClayCode 文件变更监听`);
+    console.log(`   项目目录: ${projectRoot}`);
+    console.log(`   防抖间隔: ${debounceMs}ms`);
+    console.log(`   闲置超时: ${idleTimeoutMs / 1000}s`);
+    console.log(`   按 Ctrl+C 退出\n`);
+
+    const watcher = new FileWatcher({
+      projectRoot,
+      debounceMs,
+      idleTimeoutMs,
+      recursive: opts.recursive,
+      onChange: (changes) => {
+        const now = new Date().toLocaleTimeString();
+        for (const change of changes) {
+          const icon = change.event === 'create' ? '📄+' : change.event === 'delete' ? '📄-' : '📄~';
+          console.log(`  [${now}] ${icon} ${change.event.toUpperCase().padEnd(6)} ${change.filePath}`);
+        }
+      },
+    });
+
+    watcher.start();
+
+    // 监听 Ctrl+C 优雅退出
+    process.on('SIGINT', () => {
+      console.log('\n\n🛑 正在停止文件监听...');
+      watcher.stop();
+      console.log('✅ 文件监听已停止');
+      process.exit(0);
+    });
+
+    // 保持进程运行
+    await new Promise(() => { /* 永久等待直到 Ctrl+C */ });
   });
 
 // ---- clay doctor ----
@@ -477,6 +713,113 @@ program
     }
   });
 
+// ---- clay deps ----
+program
+  .command('deps')
+  .description('查看文件依赖图谱')
+  .option('-f, --file <file>', '查看指定文件的依赖关系')
+  .option('-t, --transitive <file>', '查看传递依赖（间接依赖）')
+  .option('-d, --depth <depth>', '传递依赖最大深度', '5')
+  .option('-c, --cycles', '检测循环依赖')
+  .option('-s, --stats', '显示依赖图谱统计信息')
+  .action(async (options) => {
+    const { CodeIndexer } = await import('../core/code-index');
+    const indexer = new CodeIndexer(process.cwd());
+    indexer.indexProject();
+
+    if (options.stats) {
+      const graph = indexer.buildDependencyGraph();
+      console.log('\n📊 依赖图谱统计\n');
+      console.log(`  文件节点: ${graph.nodes.size}`);
+      console.log(`  依赖边数: ${graph.totalEdges}`);
+      console.log(`  循环依赖: ${graph.cycles.length}`);
+      if (graph.cycles.length > 0) {
+        console.log('\n  ⚠️  检测到循环依赖:');
+        for (const cycle of graph.cycles) {
+          console.log(`    ${cycle.join(' → ')} → ${cycle[0]}`);
+        }
+      }
+      console.log('');
+      return;
+    }
+
+    if (options.cycles) {
+      const graph = indexer.buildDependencyGraph();
+      console.log('\n🔄 循环依赖检测\n');
+      if (graph.cycles.length === 0) {
+        console.log('  ✅ 未检测到循环依赖\n');
+      } else {
+        console.log(`  ⚠️  发现 ${graph.cycles.length} 个循环依赖:\n`);
+        for (let i = 0; i < graph.cycles.length; i++) {
+          const cycle = graph.cycles[i];
+          console.log(`  ${i + 1}. ${cycle.join(' → ')} → ${cycle[0]}`);
+        }
+        console.log('');
+      }
+      return;
+    }
+
+    if (options.transitive) {
+      const filePath = path.resolve(options.transitive);
+      const deps = indexer.getTransitiveDependencies(filePath, parseInt(options.depth));
+      console.log(`\n🔗 ${path.relative(process.cwd(), filePath)} 的传递依赖 (深度≤${options.depth})\n`);
+      if (deps.length === 0) {
+        console.log('  (无传递依赖)');
+      } else {
+        for (const dep of deps) {
+          console.log(`  → ${path.relative(process.cwd(), dep)}`);
+        }
+      }
+      console.log('');
+      return;
+    }
+
+    if (options.file) {
+      const filePath = path.resolve(options.file);
+      const node = indexer.getFileDependencies(filePath);
+      console.log(`\n📦 ${path.relative(process.cwd(), filePath)} 的依赖关系\n`);
+      if (!node) {
+        console.log('  (文件未在索引中)');
+      } else {
+        console.log(`  语言: ${node.language}`);
+        console.log(`  符号数: ${node.symbolCount}`);
+        if (node.dependencies.length > 0) {
+          console.log(`\n  依赖 (${node.dependencies.length}):`);
+          for (const dep of node.dependencies) {
+            console.log(`    → ${path.relative(process.cwd(), dep)}`);
+          }
+        } else {
+          console.log('\n  依赖: (无)');
+        }
+        if (node.dependents.length > 0) {
+          console.log(`\n  被依赖 (${node.dependents.length}):`);
+          for (const dep of node.dependents) {
+            console.log(`    ← ${path.relative(process.cwd(), dep)}`);
+          }
+        } else {
+          console.log('\n  被依赖: (无)');
+        }
+      }
+      console.log('');
+      return;
+    }
+
+    // 默认：显示图谱概览
+    const graph = indexer.buildDependencyGraph();
+    console.log('\n📊 项目依赖图谱\n');
+    console.log(`  文件: ${graph.nodes.size}  依赖边: ${graph.totalEdges}  循环: ${graph.cycles.length}\n`);
+    
+    const sortedNodes = [...graph.nodes.values()]
+      .sort((a, b) => b.dependencies.length - a.dependencies.length)
+      .slice(0, 20);
+    
+    console.log('  依赖最多的文件 (Top 20):');
+    for (const node of sortedNodes) {
+      console.log(`    ${path.relative(process.cwd(), node.filePath)} (${node.dependencies.length}个依赖)`);
+    }
+    console.log('');
+  });
+
 // ---- clay plugin ----
 program
   .command('plugin')
@@ -484,7 +827,10 @@ program
   .option('-l, --list', '列出已加载插件')
   .option('-i, --install <path>', '安装插件（指定插件目录路径）')
   .option('-u, --uninstall <name>', '卸载插件')
-  .action(async (opts: { list?: boolean; install?: string; uninstall?: string }) => {
+  .option('-r, --reload <name>', '热重载指定插件')
+  .option('--reload-all', '热重载所有已变更插件')
+  .option('-w, --watch', '启动插件目录文件监听（自动热重载）')
+  .action(async (opts: { list?: boolean; install?: string; uninstall?: string; reload?: string; reloadAll?: boolean; watch?: boolean }) => {
     const cm = new ConfigManager();
     const pluginsDir = cm.getPluginsDir();
     const pm = new PluginManager(pluginsDir);
@@ -512,6 +858,52 @@ program
       return;
     }
 
+    if (opts.reload) {
+      await pm.loadAll();
+      const result = await pm.reloadPlugin(opts.reload);
+      if (result) {
+        console.log(`✅ 插件热重载成功: ${opts.reload} v${result.descriptor.version}`);
+      } else {
+        console.log(`❌ 插件热重载失败: ${opts.reload}`);
+      }
+      return;
+    }
+
+    if (opts.reloadAll) {
+      await pm.loadAll();
+      const result = await pm.hotReload();
+      console.log('\n🔄 插件热重载结果:\n');
+      if (result.reloaded.length > 0) console.log(`  重载: ${result.reloaded.join(', ')}`);
+      if (result.added.length > 0) console.log(`  新增: ${result.added.join(', ')}`);
+      if (result.removed.length > 0) console.log(`  移除: ${result.removed.join(', ')}`);
+      if (result.errors.length > 0) console.log(`  错误: ${result.errors.join(', ')}`);
+      if (result.reloaded.length + result.added.length + result.removed.length === 0) {
+        console.log('  无变更');
+      }
+      console.log('');
+      return;
+    }
+
+    if (opts.watch) {
+      await pm.loadAll();
+      await pm.setupAll();
+      pm.watchPlugins();
+      console.log(`\n👀 正在监听插件目录: ${pluginsDir}`);
+      console.log('  插件文件变更将自动触发热重载');
+      console.log('  按 Ctrl+C 停止监听\n');
+
+      // 优雅退出
+      process.on('SIGINT', () => {
+        pm.stopWatching();
+        console.log('\n已停止插件监听');
+        process.exit(0);
+      });
+
+      // 保持进程运行
+      setInterval(() => {}, 60000);
+      return;
+    }
+
     // 默认列出所有插件
     const loadResult = await pm.loadAll();
     const plugins = pm.getPlugins();
@@ -531,6 +923,130 @@ program
       }
     }
     console.log(`\n  加载: ${loadResult.loaded}成功, ${loadResult.failed}失败\n`);
+  });
+
+// ---- clay plugin market (V1.1) ----
+program
+  .command('market')
+  .description('插件市场管理')
+  .option('-s, --search <keyword>', '搜索插件')
+  .option('-i, --install <name>', '从市场安装插件')
+  .option('--info <name>', '查看插件详情')
+  .option('-p, --publish <dir>', '发布插件到市场（指定插件目录）')
+  .option('-l, --list', '列出市场所有插件')
+  .option('--type <type>', '按类型过滤 (adapter/tool/hook)')
+  .option('--sync', '从远程注册表同步')
+  .action(async (opts: {
+    search?: string; install?: string; info?: string; publish?: string;
+    list?: boolean; type?: string; sync?: boolean;
+  }) => {
+    const cm = new ConfigManager();
+    const pluginsDir = cm.getPluginsDir();
+    const market = new PluginMarketManager({ registryDir: pluginsDir });
+
+    if (opts.search) {
+      const result = market.search(opts.search, {
+        type: opts.type as 'adapter' | 'tool' | 'hook' | undefined,
+      });
+      if (result.entries.length === 0) {
+        console.log(`\n未找到与 "${opts.search}" 相关的插件\n`);
+        return;
+      }
+      console.log(`\n🔍 搜索 "${opts.search}" (${result.total}个结果):\n`);
+      for (const e of result.entries) {
+        console.log(`  ${e.name} v${e.version} (${e.type}) - ${e.description}`);
+        console.log(`    作者: ${e.author} | 下载: ${e.downloads} | 标签: ${e.tags.join(', ')}`);
+      }
+      console.log();
+      return;
+    }
+
+    if (opts.install) {
+      console.log(`\n📦 从市场安装插件: ${opts.install}`);
+      const result = await market.install(opts.install, pluginsDir);
+      if (result.success) {
+        console.log(`✅ ${result.message}`);
+      } else {
+        console.error(`❌ ${result.message}`);
+      }
+      return;
+    }
+
+    if (opts.info) {
+      const entry = market.info(opts.info);
+      if (!entry) {
+        console.log(`\n未找到插件: ${opts.info}\n`);
+        return;
+      }
+      console.log(`\n📋 插件详情:\n`);
+      console.log(`  名称: ${entry.name}`);
+      console.log(`  版本: ${entry.version}`);
+      console.log(`  类型: ${entry.type}`);
+      console.log(`  描述: ${entry.description}`);
+      console.log(`  作者: ${entry.author}`);
+      console.log(`  来源: ${entry.sourceUrl}`);
+      console.log(`  下载: ${entry.downloads}`);
+      console.log(`  标签: ${entry.tags.join(', ')}`);
+      console.log(`  发布: ${new Date(entry.publishedAt).toLocaleString('zh-CN')}`);
+      console.log(`  更新: ${new Date(entry.updatedAt).toLocaleString('zh-CN')}`);
+      console.log();
+      return;
+    }
+
+    if (opts.publish) {
+      const dir = opts.publish;
+      if (!fs.existsSync(path.join(dir, 'plugin.json'))) {
+        console.error(`\n❌ 插件目录缺少 plugin.json: ${dir}\n`);
+        return;
+      }
+      try {
+        const raw = fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8');
+        const descriptor = JSON.parse(raw);
+        const result = market.publish({
+          name: descriptor.name,
+          version: descriptor.version,
+          type: descriptor.type,
+          description: descriptor.description || '',
+          author: descriptor.author || 'unknown',
+          sourceUrl: `file://${path.resolve(dir)}`,
+          tags: descriptor.tags || [],
+        });
+        if (result.success) {
+          console.log(`\n✅ ${result.message}\n`);
+        } else {
+          console.error(`\n❌ ${result.message}\n`);
+        }
+      } catch (err: unknown) {
+        console.error(`\n❌ 发布失败: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+      return;
+    }
+
+    if (opts.sync) {
+      console.log('\n🔄 同步远程注册表...');
+      const result = await market.syncFromRemote();
+      if (result.success) {
+        console.log(`✅ ${result.message}`);
+      } else {
+        console.error(`❌ ${result.message}`);
+      }
+      return;
+    }
+
+    // 默认列出市场所有插件
+    const entries = market.list({
+      type: opts.type as 'adapter' | 'tool' | 'hook' | undefined,
+    });
+    if (entries.length === 0) {
+      console.log('\n市场暂无插件\n');
+      return;
+    }
+    console.log(`\n🏪 插件市场 (${entries.length}个):\n`);
+    for (const e of entries) {
+      console.log(`  ${e.name} v${e.version} (${e.type}) - ${e.description}`);
+      console.log(`    作者: ${e.author} | 下载: ${e.downloads}`);
+    }
+    console.log();
   });
 
 // ---- clay metrics ----
@@ -555,6 +1071,75 @@ program
     console.log(`  文件写入: ${snapshot.fileOpsWrite}次`);
     console.log(`  命令成功率: ${(snapshot.commandSuccessRate * 100).toFixed(1)}%`);
     console.log(`  浏览器重启: ${snapshot.browserRestarts}次\n`);
+  });
+
+// ---- clay web (V1.2 Web管理面板) ----
+program
+  .command('web')
+  .description('启动Web管理面板')
+  .option('-p, --port <port>', 'HTTP端口', '18080')
+  .option('--host <host>', '绑定主机', 'localhost')
+  .option('--no-open', '不自动打开浏览器')
+  .action(async (opts: { port: string; host: string; open?: boolean }) => {
+    const panel = new WebPanelManager({
+      port: parseInt(opts.port, 10),
+      host: opts.host,
+      openBrowser: opts.open !== false,
+    });
+
+    try {
+      await panel.start();
+      const url = panel.getUrl();
+      console.log(`\n🌐 Web管理面板已启动: ${url}`);
+      console.log('按 Ctrl+C 停止服务\n');
+
+      // 优雅关闭
+      process.on('SIGINT', async () => {
+        console.log('\n正在关闭Web面板...');
+        await panel.stop();
+        process.exit(0);
+      });
+
+      // 保持进程运行
+      await new Promise<void>(() => {});
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`\n❌ Web面板启动失败: ${message}`);
+      process.exit(1);
+    }
+  });
+
+// ---- clay report (V1.2 批量导出Markdown报告) ----
+program
+  .command('report')
+  .description('导出任务修改记录Markdown报告')
+  .option('-o, --output <dir>', '输出目录', process.cwd())
+  .option('-t, --title <title>', '报告标题', 'ClayCode 任务报告')
+  .option('-s, --session <id>', '指定会话ID（默认导出所有会话）')
+  .option('--no-chat', '不包含对话记录')
+  .option('--no-changes', '不包含文件变更记录')
+  .option('--no-metrics', '不包含执行统计')
+  .action((opts: { output: string; title: string; session?: string; chat?: boolean; changes?: boolean; metrics?: boolean }) => {
+    const exporter = new ReportExporter();
+
+    const result = exporter.exportReport({
+      outputDir: opts.output,
+      title: opts.title,
+      sessionId: opts.session,
+      includeChatHistory: opts.chat !== false,
+      includeFileChanges: opts.changes !== false,
+      includeMetrics: opts.metrics !== false,
+    });
+
+    if (result.success) {
+      console.log(`\n✅ ${result.message}`);
+      console.log(`   会话数: ${result.sessionCount}`);
+      console.log(`   文件变更: ${result.fileChangeCount}条`);
+      console.log(`   生成时间: ${new Date(result.generatedAt).toLocaleString('zh-CN')}\n`);
+    } else {
+      console.error(`\n❌ ${result.message}\n`);
+      process.exit(1);
+    }
   });
 
 // ---- clay completion ----
@@ -607,7 +1192,7 @@ _clay_completion() {
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
   
-  commands="agent chat login config session log doctor plugin metrics completion"
+  commands="agent chat login config session log doctor deps plugin metrics market web report completion"
   adapters="doubao chatgpt-web claude-web ollama kimi qwen"
   config_keys="defaultAdapter dataDir browserDataPath chromePath sessionDir maxContextChunk maxHistoryMessages requestTimeout responseTimeout autoSyncExecuteLog browserHeadless execWhiteList enableSandbox cacheLevel maxBatchFiles browserIdleTimeout maxRetryCount ollamaEndpoint enableDockerSandbox metricsPort apiKey proxyUrl"
   session_actions="new use recover list delete"
@@ -685,8 +1270,12 @@ _clay() {
     'session:管理会话'
     'log:查看日志'
     'doctor:诊断环境问题'
+    'deps:查看文件依赖图谱'
     'plugin:管理插件'
+    'market:插件市场管理'
     'metrics:查看监控指标'
+    'web:启动Web管理面板'
+    'report:导出任务报告'
     'completion:生成Shell自动补全脚本'
   )
   

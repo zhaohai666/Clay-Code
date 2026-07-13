@@ -309,10 +309,16 @@ export class ClayCodeEngine {
           const result = results[i];
           const tc = toolCalls[i];
           if (tc) {
-            this.metrics.recordFileOperation(tc.tool as 'read' | 'write' | 'edit' | 'bash');
-            // 增量上下文：追踪文件变更
+            this.metrics.recordFileOperation(tc.tool as 'read' | 'write' | 'edit' | 'bash' | 'git');
+            // 增量上下文：追踪文件变更（write/edit操作 + Git操作变更记录）
             if (tc.filePath && ['write', 'edit'].includes(tc.tool)) {
               this.changedFiles.add(tc.filePath);
+            }
+            // README 3.4.3：Git变更记录自动同步至AI上下文
+            if (tc.tool === 'git' && result.operateFiles.length > 0) {
+              for (const f of result.operateFiles) {
+                this.changedFiles.add(f);
+              }
             }
           }
           this.metrics.recordCommandResult(result.success);

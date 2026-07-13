@@ -1,15 +1,44 @@
 /**
  * ClayCode 安全模块
  * AES-256-CBC加密存储、路径越权拦截、命令白名单校验、轻量沙箱隔离
+ * V1.1: .clayignore权限规则完整支持（只读/禁止删除/忽略）
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'child_process';
 import {
   ToolCall, ToolType, ToolCallValidationResult, ErrorCode, ERROR_MESSAGES,
 } from '../types';
 import { logger, normalizePath } from '../utils';
+
+/** .clayignore规则条目 */
+interface ClayignoreRule {
+  /** 原始模式字符串 */
+  pattern: string;
+  /** 是否为反向模式（!开头） */
+  negated: boolean;
+  /** 是否为目录模式（/结尾） */
+  directoryOnly: boolean;
+  /** 编译后的正则表达式 */
+  regex: RegExp;
+}
+
+/** .clayignore访问控制标记 */
+interface ClayignoreAccessControl {
+  /** 只读目录模式列表 */
+  readonlyPatterns: string[];
+  /** 禁止删除目录模式列表 */
+  nodeletePatterns: string[];
+  /** 编译后的只读正则 */
+  readonlyRegexes: RegExp[];
+  /** 编译后的禁止删除正则 */
+  nodeleteRegexes: RegExp[];
+}
+
+/** 文件访问操作类型 */
+type FileAccessOperation = 'read' | 'write' | 'edit' | 'delete' | 'glob';
 
 /** 加密算法 */
 const ALGORITHM = 'aes-256-cbc';
@@ -33,12 +62,26 @@ export class SecurityManager {
   private maxBatchFiles: number;
   private enableDockerSandbox: boolean;
 
+  /** .clayignore忽略规则列表 */
+  private ignoreRules: ClayignoreRule[] = [];
+  /** .clayignore访问控制规则 */
+  private accessControl: ClayignoreAccessControl = {
+    readonlyPatterns: [],
+    nodeletePatterns: [],
+    readonlyRegexes: [],
+    nodeleteRegexes: [],
+  };
+  /** .clayignore是否已加载 */
+  private clayignoreLoaded: boolean = false;
+
   constructor(projectRoot: string, options?: { masterKey?: string; execWhiteList?: string[]; maxBatchFiles?: number; enableDockerSandbox?: boolean }) {
     this.projectRoot = normalizePath(path.resolve(projectRoot));
     this.masterKey = options?.masterKey ?? 'claycode-default-key-change-in-production';
     this.execWhiteList = options?.execWhiteList ?? ['git', 'npm', 'pnpm', 'yarn', 'node', 'npx', 'tsc', 'eslint', 'prettier', 'mvn', 'gradle'];
     this.maxBatchFiles = options?.maxBatchFiles ?? 50;
     this.enableDockerSandbox = options?.enableDockerSandbox ?? false;
+    // V1.1: 自动加载.clayignore权限规则
+    this.loadClayignore();
   }
 
   // ---- AES-256-CBC 加密/解密 ----
@@ -123,6 +166,249 @@ export class SecurityManager {
       }
     }
     return { valid: invalidPaths.length === 0, invalidPaths };
+  }
+
+  // ---- .clayignore 权限规则 (V1.1 README 6.1) ----
+
+  /**
+   * 加载.clayignore文件
+   * 兼容.gitignore语法，支持额外标记：
+   * - [readonly] <pattern>  标记目录/文件为只读（禁止写入/编辑）
+   * - [nodelete] <pattern>  标记目录/文件为禁止删除
+   * - <pattern>             普通忽略规则（禁止任何访问）
+   */
+  loadClayignore(clayignorePath?: string): void {
+    const ignoreFile = clayignorePath || path.join(this.projectRoot, '.clayignore');
+    if (!fs.existsSync(ignoreFile)) {
+      logger.info('[SecurityManager] .clayignore 文件不存在，跳过加载');
+      this.clayignoreLoaded = true;
+      return;
+    }
+
+    try {
+      const content = fs.readFileSync(ignoreFile, 'utf-8');
+      const lines = content.split(/\r?\n/);
+
+      this.ignoreRules = [];
+      this.accessControl = {
+        readonlyPatterns: [],
+        nodeletePatterns: [],
+        readonlyRegexes: [],
+        nodeleteRegexes: [],
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        // 去除行尾空格，保留行首空格（gitignore语义）
+        const line = rawLine.replace(/\s+$/, '');
+
+        // 跳过空行和注释
+        if (!line || line.startsWith('#')) continue;
+
+        // 检查访问控制标记
+        const readonlyMatch = line.match(/^\[readonly\]\s+(.+)$/);
+        if (readonlyMatch) {
+          const pattern = readonlyMatch[1].trim();
+          this.accessControl.readonlyPatterns.push(pattern);
+          this.accessControl.readonlyRegexes.push(this.compileGitignorePattern(pattern));
+          logger.info(`[SecurityManager] .clayignore 只读规则: ${pattern}`);
+          continue;
+        }
+
+        const nodeleteMatch = line.match(/^\[nodelete\]\s+(.+)$/);
+        if (nodeleteMatch) {
+          const pattern = nodeleteMatch[1].trim();
+          this.accessControl.nodeletePatterns.push(pattern);
+          this.accessControl.nodeleteRegexes.push(this.compileGitignorePattern(pattern));
+          logger.info(`[SecurityManager] .clayignore 禁止删除规则: ${pattern}`);
+          continue;
+        }
+
+        // 普通忽略规则
+        const negated = line.startsWith('!');
+        const patternStr = negated ? line.substring(1) : line;
+        const directoryOnly = patternStr.endsWith('/');
+
+        this.ignoreRules.push({
+          pattern: line,
+          negated,
+          directoryOnly,
+          regex: this.compileGitignorePattern(patternStr),
+        });
+      }
+
+      this.clayignoreLoaded = true;
+      logger.info(`[SecurityManager] .clayignore 已加载: ${this.ignoreRules.length} 忽略规则, ` +
+        `${this.accessControl.readonlyPatterns.length} 只读规则, ` +
+        `${this.accessControl.nodeletePatterns.length} 禁止删除规则`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`[SecurityManager] .clayignore 加载失败: ${message}`);
+      this.clayignoreLoaded = true; // 标记已尝试加载，避免重复
+    }
+  }
+
+  /**
+   * 将gitignore风格模式编译为正则表达式
+   * 支持基础gitignore语法：*通配、**递归、?单字符、[abc]字符集、/目录分隔
+   */
+  private compileGitignorePattern(pattern: string): RegExp {
+    let regexStr = pattern;
+
+    // 转义正则特殊字符（保留gitignore通配符）
+    regexStr = regexStr.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+
+    // 处理gitignore语法
+    // **/ 前缀：匹配任意目录深度
+    regexStr = regexStr.replace(/\*\*\\/g, '(?:.*/)?');
+    // /**/ 中间：匹配任意目录层级
+    regexStr = regexStr.replace(/\/\*\*\//g, '/(?:.*/)?');
+    // /** 后缀：匹配任意内容
+    regexStr = regexStr.replace(/\/\*\*$/g, '/.*');
+    // * 通配符：匹配非路径分隔符
+    regexStr = regexStr.replace(/\*/g, '[^/]*');
+    // ? 单字符通配
+    regexStr = regexStr.replace(/\?/g, '[^/]');
+    // / 目录分隔保持原样
+
+    // 如果模式不以/开头，则可以在任意目录深度匹配
+    if (!pattern.startsWith('/') && !pattern.startsWith('**/')) {
+      regexStr = '(?:.*/)?' + regexStr;
+    }
+
+    // 如果模式以/结尾，匹配目录
+    if (pattern.endsWith('/')) {
+      regexStr = regexStr + '.*';
+    }
+
+    return new RegExp('^' + regexStr + '$');
+  }
+
+  /**
+   * 检查文件路径是否匹配.clayignore忽略规则
+   * @returns true表示被忽略（禁止访问）
+   */
+  isIgnored(filePath: string): boolean {
+    if (!this.clayignoreLoaded) {
+      this.loadClayignore();
+    }
+
+    // 转换为相对于项目根的路径
+    const absPath = normalizePath(path.resolve(filePath));
+    const relPath = path.relative(this.projectRoot, absPath).replace(/\\/g, '/');
+
+    if (!relPath || relPath.startsWith('..')) {
+      return false; // 项目外的文件不归clayignore管
+    }
+
+    let ignored = false;
+    for (const rule of this.ignoreRules) {
+      // 目录专属规则：只匹配目录
+      if (rule.directoryOnly && !relPath.includes('/')) {
+        // 如果模式是目录专属但路径不含/，尝试追加/匹配
+        const dirPath = relPath + '/';
+        if (rule.regex.test(dirPath) || rule.regex.test(relPath + '/')) {
+          ignored = !rule.negated;
+        }
+        continue;
+      }
+
+      if (rule.regex.test(relPath)) {
+        ignored = !rule.negated;
+      }
+    }
+
+    return ignored;
+  }
+
+  /**
+   * 检查文件路径是否为只读
+   * @returns true表示只读（禁止写入/编辑/删除）
+   */
+  isReadOnly(filePath: string): boolean {
+    if (!this.clayignoreLoaded) {
+      this.loadClayignore();
+    }
+
+    const absPath = normalizePath(path.resolve(filePath));
+    const relPath = path.relative(this.projectRoot, absPath).replace(/\\/g, '/');
+
+    if (!relPath || relPath.startsWith('..')) {
+      return false;
+    }
+
+    for (const regex of this.accessControl.readonlyRegexes) {
+      if (regex.test(relPath)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 检查文件路径是否禁止删除
+   * @returns true表示禁止删除
+   */
+  isNoDelete(filePath: string): boolean {
+    if (!this.clayignoreLoaded) {
+      this.loadClayignore();
+    }
+
+    const absPath = normalizePath(path.resolve(filePath));
+    const relPath = path.relative(this.projectRoot, absPath).replace(/\\/g, '/');
+
+    if (!relPath || relPath.startsWith('..')) {
+      return false;
+    }
+
+    for (const regex of this.accessControl.nodeleteRegexes) {
+      if (regex.test(relPath)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 综合文件访问权限校验（V1.1 .clayignore完整支持）
+   * @param filePath 文件路径
+   * @param operation 操作类型
+   * @returns 校验结果
+   */
+  checkFileAccess(filePath: string, operation: FileAccessOperation): { allowed: boolean; reason?: string } {
+    // 1. 基础路径越权校验
+    const pathResult = this.validatePath(filePath);
+    if (!pathResult.valid) {
+      return { allowed: false, reason: pathResult.reason };
+    }
+
+    // 2. .clayignore忽略规则校验（所有操作都受约束）
+    if (this.isIgnored(filePath)) {
+      return { allowed: false, reason: `.clayignore规则拦截: ${path.relative(this.projectRoot, pathResult.absPath)} 被忽略` };
+    }
+
+    // 3. 只读规则校验（write/edit/delete操作受约束）
+    if ((operation === 'write' || operation === 'edit' || operation === 'delete') && this.isReadOnly(filePath)) {
+      return { allowed: false, reason: `.clayignore只读规则拦截: ${path.relative(this.projectRoot, pathResult.absPath)} 为只读` };
+    }
+
+    // 4. 禁止删除规则校验（delete操作受约束）
+    if (operation === 'delete' && this.isNoDelete(filePath)) {
+      return { allowed: false, reason: `.clayignore禁止删除规则拦截: ${path.relative(this.projectRoot, pathResult.absPath)} 禁止删除` };
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * 获取当前.clayignore规则摘要
+   */
+  getClayignoreSummary(): { ignoreCount: number; readonlyCount: number; nodeleteCount: number } {
+    return {
+      ignoreCount: this.ignoreRules.length,
+      readonlyCount: this.accessControl.readonlyPatterns.length,
+      nodeleteCount: this.accessControl.nodeletePatterns.length,
+    };
   }
 
   // ---- 命令白名单校验 ----
@@ -227,10 +513,22 @@ export class SecurityManager {
             fixSuggestion = '请使用项目目录内的文件路径';
           }
           // 危险路径检测
-          const dangerousPatterns = ['/etc/', '/root/', 'C:\\Windows', 'C:\\System32', '/sys/', '/proc/'];
+          const dangerousPatterns = ['/etc/', '/root/', 'C:\\\\Windows', 'C:\\\\System32', '/sys/', '/proc/'];
           if (dangerousPatterns.some(p => tc.filePath!.includes(p))) {
             errors.push(`检测到危险系统路径: ${tc.filePath}`);
             fixSuggestion = '禁止访问系统目录';
+          }
+          // V1.1 .clayignore 访问控制校验
+          const opMap: Record<string, FileAccessOperation> = {
+            read: 'read', edit: 'edit', write: 'write', view: 'read', run_test: 'read', symbol_search: 'read',
+          };
+          const accessOp = opMap[tc.tool] as FileAccessOperation | undefined;
+          if (accessOp && pathResult.valid) {
+            const accessResult = this.checkFileAccess(tc.filePath!, accessOp);
+            if (!accessResult.allowed) {
+              errors.push(accessResult.reason || '.clayignore规则拦截');
+              fixSuggestion = '该文件受.clayignore规则保护，请检查.clayignore配置';
+            }
           }
         }
         // write操作需要content
@@ -291,7 +589,7 @@ export class SecurityManager {
     const invalid: Array<{ tc: ToolCall; result: ToolCallValidationResult }> = [];
 
     // 批量文件操作数量上限检测
-    const fileOps = toolCalls.filter(tc => ['read', 'edit', 'write'].includes(tc.tool));
+    const fileOps = toolCalls.filter(tc => ['read', 'edit', 'write', 'view', 'run_test', 'symbol_search'].includes(tc.tool));
     if (fileOps.length > this.maxBatchFiles) {
       logger.warn(`[SecurityManager] 批量文件操作数量 ${fileOps.length} 超过上限 ${this.maxBatchFiles}，已截断`);
       // 保留前maxBatchFiles个文件操作
