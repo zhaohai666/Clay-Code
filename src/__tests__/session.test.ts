@@ -330,7 +330,7 @@ describe('SessionManager', () => {
       const restored = sm.restoreCheckpoint('nonexistent-checkpoint-id');
       expect(restored).toBeDefined();
       // 应该回退到了cp
-      expect(restored!.checkpoints.length).toBe(1);
+      expect(restored!.checkpoints!.length).toBe(1);
     });
 
     it('restoreCheckpoint数据损坏时应回退到前一个有效检查点', () => {
@@ -352,8 +352,8 @@ describe('SessionManager', () => {
       const restored = sm.restoreCheckpoint(cp2!.id);
       expect(restored).toBeDefined();
       // 应该回退到了cp1
-      expect(restored!.checkpoints.length).toBe(1);
-      expect(restored!.checkpoints[0].id).toBe(cp1!.id);
+      expect(restored!.checkpoints!.length).toBe(1);
+      expect(restored!.checkpoints![0].id).toBe(cp1!.id);
     });
 
     it('restoreCheckpoint无活跃会话应返回null', () => {

@@ -60,6 +60,10 @@ export class ReportExporter {
       // 写入文件
       const fileName = `claycode-report-${dateStr.replace(/[ :]/g, '-').replace(/\//g, '')}.md`;
       const filePath = path.join(opts.outputDir, fileName);
+      // 确保输出目录存在
+      if (!fs.existsSync(opts.outputDir)) {
+        fs.mkdirSync(opts.outputDir, { recursive: true });
+      }
       fs.writeFileSync(filePath, markdown, 'utf-8');
 
       // 统计文件变更数

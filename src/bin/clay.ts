@@ -258,6 +258,7 @@ sessionCmd
   .action(async (sessionName?: string, opts?: { adapter?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
+    await sm.init();
     const session = sm.createSession(sessionName || undefined);
     if (opts?.adapter) {
       session.adapter = opts.adapter as any;
@@ -270,10 +271,11 @@ sessionCmd
   .command('use')
   .description('切换到指定会话')
   .argument('<session-id>', '会话ID或名称')
-  .action((sessionId: string) => {
+  .action(async (sessionId: string) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    const session = sm.getSession(sessionId);
+    await sm.init();
+    const session = sm.resolveSession(sessionId);
     if (session) {
       // 更新最后活跃时间，标记为当前会话
       session.lastActiveAt = Date.now();
@@ -288,9 +290,10 @@ sessionCmd
 sessionCmd
   .command('recover')
   .description('恢复最近一次会话')
-  .action(() => {
+  .action(async () => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
+    await sm.init();
     const session = sm.recoverSession();
     if (session) {
       console.log(`✅ 已恢复会话: ${session.sessionName} (${session.sessionId})`);
@@ -303,9 +306,10 @@ sessionCmd
 sessionCmd
   .command('list')
   .description('列出所有会话')
-  .action(() => {
+  .action(async () => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
+    await sm.init();
     const sessions = sm.listSessions();
     if (sessions.length === 0) {
       console.log('暂无会话');
@@ -325,11 +329,17 @@ sessionCmd
   .command('delete')
   .description('删除指定会话')
   .argument('<session-id>', '会话ID')
-  .action((sessionId: string) => {
+  .action(async (sessionId: string) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.deleteSession(sessionId);
-    console.log(`✅ 会话 ${sessionId} 已删除`);
+    await sm.init();
+    const session = sm.resolveSession(sessionId);
+    if (session) {
+      sm.deleteSession(session.sessionId);
+      console.log(`✅ 会话 ${session.sessionName} (${session.sessionId}) 已删除`);
+    } else {
+      console.log(`❌ 会话不存在: ${sessionId}`);
+    }
   });
 
 // ---- clay session checkpoint (V1.2) ----
@@ -341,14 +351,14 @@ checkpointCmd
   .command('list')
   .description('列出当前会话的检查点')
   .option('-s, --session <id>', '会话ID或名称')
-  .action((opts: { session?: string }) => {
+  .action(async (opts: { session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -370,14 +380,14 @@ checkpointCmd
   .description('从检查点恢复会话')
   .argument('<checkpoint-id>', '检查点ID')
   .option('-s, --session <id>', '会话ID或名称')
-  .action((checkpointId: string, opts: { session?: string }) => {
+  .action(async (checkpointId: string, opts: { session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -409,14 +419,14 @@ workspaceCmd
   .argument('<name>', '工作区名称')
   .option('-p, --path <path>', '项目路径', process.cwd())
   .option('-s, --session <id>', '会话ID或名称')
-  .action((name: string, opts: { path: string; session?: string }) => {
+  .action(async (name: string, opts: { path: string; session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -438,14 +448,14 @@ workspaceCmd
   .description('切换到指定工作区')
   .argument('<workspace-id>', '工作区ID')
   .option('-s, --session <id>', '会话ID或名称')
-  .action((workspaceId: string, opts: { session?: string }) => {
+  .action(async (workspaceId: string, opts: { session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -466,14 +476,14 @@ workspaceCmd
   .command('list')
   .description('列出所有工作区')
   .option('-s, --session <id>', '会话ID或名称')
-  .action((opts: { session?: string }) => {
+  .action(async (opts: { session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -495,14 +505,14 @@ workspaceCmd
   .description('删除指定工作区')
   .argument('<workspace-id>', '工作区ID')
   .option('-s, --session <id>', '会话ID或名称')
-  .action((workspaceId: string, opts: { session?: string }) => {
+  .action(async (workspaceId: string, opts: { session?: string }) => {
     const cm = new ConfigManager();
     const sm = new SessionManager(cm.getSessionDir());
-    sm.init();
+    await sm.init();
 
     const sessionId = opts.session;
     if (sessionId) {
-      const session = sm.getSession(sessionId);
+      const session = sm.resolveSession(sessionId);
       if (!session) {
         console.log(`❌ 会话不存在: ${sessionId}`);
         return;
@@ -761,13 +771,14 @@ program
 
     if (options.transitive) {
       const filePath = path.resolve(options.transitive);
-      const deps = indexer.getTransitiveDependencies(filePath, parseInt(options.depth));
-      console.log(`\n🔗 ${path.relative(process.cwd(), filePath)} 的传递依赖 (深度≤${options.depth})\n`);
+      const relPath = path.relative(process.cwd(), filePath);
+      const deps = indexer.getTransitiveDependencies(relPath, parseInt(options.depth));
+      console.log(`\n🔗 ${relPath} 的传递依赖 (深度≤${options.depth})\n`);
       if (deps.length === 0) {
         console.log('  (无传递依赖)');
       } else {
         for (const dep of deps) {
-          console.log(`  → ${path.relative(process.cwd(), dep)}`);
+          console.log(`  → ${dep}`);
         }
       }
       console.log('');
@@ -776,8 +787,9 @@ program
 
     if (options.file) {
       const filePath = path.resolve(options.file);
-      const node = indexer.getFileDependencies(filePath);
-      console.log(`\n📦 ${path.relative(process.cwd(), filePath)} 的依赖关系\n`);
+      const relPath = path.relative(process.cwd(), filePath);
+      const node = indexer.getFileDependencies(relPath);
+      console.log(`\n📦 ${relPath} 的依赖关系\n`);
       if (!node) {
         console.log('  (文件未在索引中)');
       } else {
@@ -786,7 +798,7 @@ program
         if (node.dependencies.length > 0) {
           console.log(`\n  依赖 (${node.dependencies.length}):`);
           for (const dep of node.dependencies) {
-            console.log(`    → ${path.relative(process.cwd(), dep)}`);
+            console.log(`    → ${dep}`);
           }
         } else {
           console.log('\n  依赖: (无)');
@@ -794,7 +806,7 @@ program
         if (node.dependents.length > 0) {
           console.log(`\n  被依赖 (${node.dependents.length}):`);
           for (const dep of node.dependents) {
-            console.log(`    ← ${path.relative(process.cwd(), dep)}`);
+            console.log(`    ← ${dep}`);
           }
         } else {
           console.log('\n  被依赖: (无)');

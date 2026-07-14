@@ -459,7 +459,11 @@ export class CodeIndexer {
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const entry of entries) {
-        if (INDEX_IGNORE_DIRS.has(entry.name)) continue;
+        // 仅在项目根目录级别忽略 bin/obj 等构建输出目录
+        // src/bin/ 等源码目录不应被忽略
+        const isProjectRoot = dir === this.projectRoot;
+        if (isProjectRoot && INDEX_IGNORE_DIRS.has(entry.name)) continue;
+        if (!isProjectRoot && (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist' || entry.name === 'build' || entry.name === 'coverage' || entry.name === '__pycache__' || entry.name === 'target' || entry.name === '.cache' || entry.name === '.tmp' || entry.name === '.temp')) continue;
         if (entry.name.startsWith('.') && entry.name !== '.clayignore') continue;
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {

@@ -1,7 +1,6 @@
 {
   "name": "claycode",
   "version": "1.0.0",
-  "type": "module",
   "description": "ClayCode - 完全自研的一体化终端AI编码引擎，免API Key，内置浏览器桥接与本地执行引擎",
   "main": "dist/core/index.js",
   "bin": {

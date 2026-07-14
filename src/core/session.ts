@@ -79,6 +79,26 @@ export class SessionManager {
     return session;
   }
 
+  /**
+   * 解析会话ID或名称，支持部分ID前缀匹配和名称匹配
+   * 用于CLI命令中用户输入的会话标识符解析
+   */
+  resolveSession(idOrName: string): SessionState | null {
+    // 1. 精确ID匹配
+    const exact = this.sessions.get(idOrName);
+    if (exact) return exact;
+
+    // 2. 部分ID前缀匹配
+    for (const [, session] of this.sessions) {
+      if (session.sessionId.startsWith(idOrName)) {
+        return session;
+      }
+    }
+
+    // 3. 名称匹配
+    return this.findSessionByName(idOrName);
+  }
+
   /** 获取当前活跃会话 */
   getActiveSession(): SessionState | null {
     if (!this.activeSessionId) return null;
