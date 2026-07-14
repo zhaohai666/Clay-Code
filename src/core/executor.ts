@@ -294,7 +294,7 @@ export class LocalExecutor {
     // V1.1: 批量Patch冲突预检测
     const conflicts = this.detectPatchConflicts(toolCalls);
     if (conflicts.length > 0) {
-      logger.warn(`[LocalExecutor] 检测到${conflicts.length}个Patch冲突，建议调整工具调用顺序`);
+      logger.warn(`[LocalExecutor] 检测到${conflicts.length}个Patch冲突(ErrorCode=${ErrorCode.PATCH_CONFLICT})，建议调整工具调用顺序`);
       // 冲突不阻断执行，仅警告（由上层决定是否中止）
     }
 

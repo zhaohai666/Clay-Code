@@ -309,10 +309,14 @@ export enum ErrorCode {
   COMMAND_NOT_IN_WHITELIST = 2002,
   /** 命令执行异常 */
   SHELL_EXECUTION_ERROR = 2003,
+  /** 多条补丁存在文件修改冲突 */
+  PATCH_CONFLICT = 2004,
   /** 适配器不存在 */
   ADAPTER_NOT_FOUND = 3001,
   /** 会话数据解密失败 */
   SESSION_DECRYPT_FAILED = 4001,
+  /** 检查点数据损坏 */
+  CHECKPOINT_CORRUPT = 4002,
 }
 
 /** 错误码描述映射 */
@@ -325,8 +329,10 @@ export const ERROR_MESSAGES: Record<number, string> = {
   [ErrorCode.FILE_PERMISSION_DENIED]: '文件越权或权限不足',
   [ErrorCode.COMMAND_NOT_IN_WHITELIST]: 'Shell命令不在白名单，请执行 clay config set execWhiteList 添加',
   [ErrorCode.SHELL_EXECUTION_ERROR]: 'Shell命令执行异常',
+  [ErrorCode.PATCH_CONFLICT]: '多条补丁存在文件修改冲突，请调整变更方案',
   [ErrorCode.ADAPTER_NOT_FOUND]: '适配器不存在，请切换合法AI适配器',
   [ErrorCode.SESSION_DECRYPT_FAILED]: '会话数据解密失败，请重新登录',
+  [ErrorCode.CHECKPOINT_CORRUPT]: '检查点数据损坏，将加载上一个有效快照',
 };
 
 // ============================================================

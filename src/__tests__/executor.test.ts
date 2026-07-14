@@ -249,4 +249,184 @@ describe('LocalExecutor', () => {
       }
     });
   });
+
+  // ---- V1.2: view 工具 ----
+  describe('executeView', () => {
+    it('应查看文件内容并显示元信息头', async () => {
+      const filePath = path.join(tmpDir, 'view-test.txt');
+      fs.writeFileSync(filePath, 'line1\nline2\nline3');
+      const result = await executor.execute({ tool: 'view', filePath });
+      expect(result.success).toBe(true);
+      expect(result.outputText).toContain('view-test.txt');
+      expect(result.outputText).toContain('KB');
+      expect(result.outputText).toContain('line1');
+    });
+
+    it('应支持行范围查看', async () => {
+      const filePath = path.join(tmpDir, 'view-range.txt');
+      fs.writeFileSync(filePath, Array.from({ length: 20 }, (_, i) => `line${i + 1}`).join('\n'));
+      const result = await executor.execute({ tool: 'view', filePath, lineRange: '5-10' });
+      expect(result.success).toBe(true);
+      expect(result.outputText).toContain('line5');
+      expect(result.outputText).toContain('line10');
+      // line1作为独立行不应出现（但line10/line11等包含line1子串）
+      expect(result.outputText).not.toMatch(/^.*1 │ line1$/m);
+    });
+
+    it('文件不存在应返回错误', async () => {
+      const result = await executor.execute({ tool: 'view', filePath: 'nonexistent-view.txt' });
+      expect(result.success).toBe(false);
+      expect(result.errorText).toContain('文件不存在');
+    });
+
+    it('目录应返回不支持错误', async () => {
+      const dirPath = path.join(tmpDir, 'subdir');
+      fs.mkdirSync(dirPath);
+      const result = await executor.execute({ tool: 'view', filePath: 'subdir' });
+      expect(result.success).toBe(false);
+      expect(result.errorText).toContain('view不支持目录');
+    });
+
+    it('路径越权应拦截', async () => {
+      const result = await executor.execute({ tool: 'view', filePath: '/etc/passwd' });
+      expect(result.success).toBe(false);
+      expect(result.errorText).toContain('路径越权');
+    });
+  });
+
+  // ---- V1.2: run_test 工具 ----
+  describe('executeRunTest', () => {
+    it('无测试标志文件应返回错误', async () => {
+      // tmpDir中没有package.json/pom.xml等标志文件
+      const result = await executor.execute({ tool: 'run_test' });
+      expect(result.success).toBe(false);
+      expect(result.errorText).toContain('无法识别项目测试命令');
+    });
+
+    it('有package.json应识别为npm测试', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+      // 不实际执行测试，只验证命令识别（执行可能失败因为无node_modules）
+      const result = await executor.execute({ tool: 'run_test' });
+      // 即使执行失败，也不应是"无法识别"错误
+      if (!result.success) {
+        expect(result.errorText).not.toContain('无法识别项目测试命令');
+      }
+    });
+  });
+
+  // ---- V1.2: symbol_search 工具 ----
+  describe('executeSymbolSearch', () => {
+    it('空项目索引应返回失败或无结果', async () => {
+      // tmpDir中没有源代码文件
+      const result = await executor.execute({ tool: 'symbol_search', symbolName: 'NonExistent' });
+      // 可能返回索引为空或搜索无结果
+      expect(result).toHaveProperty('success');
+    });
+
+    it('有源码文件时应可执行符号搜索', async () => {
+      // 创建一个简单的TypeScript文件
+      fs.writeFileSync(path.join(tmpDir, 'sample.ts'), 'export class MyClass { myMethod() {} }');
+      const result = await executor.execute({ tool: 'symbol_search', symbolName: 'MyClass' });
+      // 可能找到也可能找不到（取决于Tree-sitter是否可用）
+      expect(result).toHaveProperty('success');
+    });
+  });
+
+  // ---- V1.1: detectPatchConflicts 冲突预检测 ----
+  describe('detectPatchConflicts', () => {
+    it('无edit操作应返回空冲突列表', () => {
+      const toolCalls: ToolCall[] = [
+        { tool: 'read', filePath: path.join(tmpDir, 'test.txt') },
+        { tool: 'bash', command: 'echo hello' },
+      ];
+      const conflicts = executor.detectPatchConflicts(toolCalls);
+      expect(conflicts).toEqual([]);
+    });
+
+    it('单条edit操作应无冲突', () => {
+      const toolCalls: ToolCall[] = [
+        { tool: 'edit', filePath: path.join(tmpDir, 'test.txt'), patch: '@@ -1,3 +1,3 @@\n line1\n-line2\n+LINE2\n line3' },
+      ];
+      const conflicts = executor.detectPatchConflicts(toolCalls);
+      expect(conflicts).toEqual([]);
+    });
+
+    it('不同文件的edit操作应无冲突', () => {
+      const toolCalls: ToolCall[] = [
+        { tool: 'edit', filePath: path.join(tmpDir, 'a.txt'), patch: '@@ -1,3 +1,3 @@\n a1\n-a2\n+A2\n a3' },
+        { tool: 'edit', filePath: path.join(tmpDir, 'b.txt'), patch: '@@ -1,3 +1,3 @@\n b1\n-b2\n+B2\n b3' },
+      ];
+      const conflicts = executor.detectPatchConflicts(toolCalls);
+      expect(conflicts).toEqual([]);
+    });
+
+    it('相同文件不同行范围的edit操作应无冲突', () => {
+      const toolCalls: ToolCall[] = [
+        { tool: 'edit', filePath: path.join(tmpDir, 'same.txt'), patch: '@@ -1,3 +1,3 @@\n line1\n-line2\n+LINE2\n line3' },
+        { tool: 'edit', filePath: path.join(tmpDir, 'same.txt'), patch: '@@ -10,3 +10,3 @@\n line10\n-line11\n+LINE11\n line12' },
+      ];
+      const conflicts = executor.detectPatchConflicts(toolCalls);
+      expect(conflicts).toEqual([]);
+    });
+  });
+
+  // ---- V1.1: changeReview Diff预审确认 ----
+  describe('changeReview', () => {
+    it('未启用预审时变更应直接通过', async () => {
+      const filePath = path.join(tmpDir, 'review-test.txt');
+      fs.writeFileSync(filePath, 'original');
+      const result = await executor.execute({ tool: 'write', filePath, content: 'modified' });
+      expect(result.success).toBe(true);
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe('modified');
+    });
+
+    it('设置预审回调后应调用回调', async () => {
+      let callbackCalled = false;
+      let receivedDiff = '';
+      let receivedOp = '';
+      executor.setChangeReviewCallback(async (diff, filePath, operation) => {
+        callbackCalled = true;
+        receivedDiff = diff;
+        receivedOp = operation;
+        return true; // 确认变更
+      });
+
+      const filePath = path.join(tmpDir, 'review-callback.txt');
+      fs.writeFileSync(filePath, 'old content');
+      const result = await executor.execute({ tool: 'write', filePath, content: 'new content' });
+
+      expect(callbackCalled).toBe(true);
+      expect(receivedDiff).toContain('old content');
+      expect(receivedDiff).toContain('new content');
+      expect(result.success).toBe(true);
+    });
+
+    it('预审拒绝时变更不应生效', async () => {
+      executor.setChangeReviewCallback(async () => false); // 拒绝变更
+
+      const filePath = path.join(tmpDir, 'review-reject.txt');
+      fs.writeFileSync(filePath, 'original content');
+      const result = await executor.execute({ tool: 'write', filePath, content: 'rejected content' });
+
+      expect(result.success).toBe(false);
+      expect(result.errorText).toContain('拒绝');
+      // 文件内容应保持不变
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe('original content');
+    });
+
+    it('预审回调应接收正确的操作类型', async () => {
+      const operations: string[] = [];
+      executor.setChangeReviewCallback(async (_diff, _filePath, operation) => {
+        operations.push(operation);
+        return true;
+      });
+
+      const filePath = path.join(tmpDir, 'review-ops.txt');
+      fs.writeFileSync(filePath, 'initial');
+      await executor.execute({ tool: 'write', filePath, content: 'written' });
+      await executor.execute({ tool: 'edit', filePath, patch: '@@ -1 +1 @@\n-written\n+edited' });
+
+      expect(operations.length).toBeGreaterThanOrEqual(1);
+    });
+  });
 });

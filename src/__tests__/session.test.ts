@@ -284,4 +284,238 @@ describe('SessionManager', () => {
       expect(encFiles.length).toBe(2);
     });
   });
+
+  // ---- 检查点管理 ----
+  describe('检查点管理', () => {
+    it('createCheckpoint应创建检查点', () => {
+      const session = sm.createSession('cp-test');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/test.ts' }];
+      const executeResults = [{ success: true, outputText: 'ok', errorText: '', exitCode: 0, operateFiles: [] }];
+      const cp = sm.createCheckpoint(toolCalls, executeResults, 'test-label');
+      expect(cp).toBeDefined();
+      expect(cp!.label).toBe('test-label');
+      expect(cp!.toolCalls.length).toBe(1);
+      expect(cp!.executeResults.length).toBe(1);
+    });
+
+    it('listCheckpoints应返回所有检查点', () => {
+      sm.createSession('cp-list');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      sm.createCheckpoint(toolCalls, executeResults);
+      sm.createCheckpoint(toolCalls, executeResults);
+      const list = sm.listCheckpoints();
+      expect(list.length).toBe(2);
+    });
+
+    it('restoreCheckpoint应恢复到指定检查点', () => {
+      const session = sm.createSession('cp-restore');
+      sm.addMessage(session.sessionId, { role: 'user', content: 'msg1' });
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      const cp = sm.createCheckpoint(toolCalls, executeResults);
+      sm.addMessage(session.sessionId, { role: 'user', content: 'msg2' });
+      // 恢复后消息应被截断
+      const restored = sm.restoreCheckpoint(cp!.id);
+      expect(restored).toBeDefined();
+      expect(restored!.messages.length).toBe(cp!.messageCount);
+    });
+
+    it('restoreCheckpoint不存在的检查点应尝试回退到最近有效检查点', () => {
+      const session = sm.createSession('cp-corrupt-notfound');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      const cp = sm.createCheckpoint(toolCalls, executeResults);
+      // 使用一个不存在的ID，应回退到最近有效检查点
+      const restored = sm.restoreCheckpoint('nonexistent-checkpoint-id');
+      expect(restored).toBeDefined();
+      // 应该回退到了cp
+      expect(restored!.checkpoints.length).toBe(1);
+    });
+
+    it('restoreCheckpoint数据损坏时应回退到前一个有效检查点', () => {
+      const session = sm.createSession('cp-corrupt-data');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      // 创建第一个有效检查点
+      const cp1 = sm.createCheckpoint(toolCalls, executeResults);
+      sm.addMessage(session.sessionId, { role: 'user', content: 'msg1' });
+      // 创建第二个有效检查点
+      const cp2 = sm.createCheckpoint(toolCalls, executeResults);
+      // 手动破坏第二个检查点的数据
+      const cpData = sm.getCheckpoint(cp2!.id);
+      if (cpData) {
+        // 删除关键字段模拟数据损坏
+        (cpData as any).toolCalls = undefined;
+      }
+      // 恢复第二个检查点时应回退到第一个
+      const restored = sm.restoreCheckpoint(cp2!.id);
+      expect(restored).toBeDefined();
+      // 应该回退到了cp1
+      expect(restored!.checkpoints.length).toBe(1);
+      expect(restored!.checkpoints[0].id).toBe(cp1!.id);
+    });
+
+    it('restoreCheckpoint无活跃会话应返回null', () => {
+      // 不创建会话
+      const result = sm.restoreCheckpoint('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('restoreCheckpoint无检查点应返回null', () => {
+      sm.createSession('cp-empty');
+      const result = sm.restoreCheckpoint('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('getLatestCheckpoint应返回最近检查点', () => {
+      sm.createSession('cp-latest');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      sm.createCheckpoint(toolCalls, executeResults);
+      sm.createCheckpoint(toolCalls, executeResults, 'latest');
+      const latest = sm.getLatestCheckpoint();
+      expect(latest).toBeDefined();
+      expect(latest!.label).toBe('latest');
+    });
+
+    it('deleteCheckpoint应删除指定检查点', () => {
+      sm.createSession('cp-delete');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      const cp = sm.createCheckpoint(toolCalls, executeResults);
+      expect(sm.listCheckpoints().length).toBe(1);
+      const deleted = sm.deleteCheckpoint(cp!.id);
+      expect(deleted).toBe(true);
+      expect(sm.listCheckpoints().length).toBe(0);
+    });
+
+    it('clearCheckpoints应清除所有检查点', () => {
+      sm.createSession('cp-clear');
+      const toolCalls = [{ tool: 'read' as const, filePath: '/tmp/a.ts' }];
+      const executeResults = [{ success: true, outputText: '', errorText: '', exitCode: 0, operateFiles: [] }];
+      sm.createCheckpoint(toolCalls, executeResults);
+      sm.createCheckpoint(toolCalls, executeResults);
+      expect(sm.listCheckpoints().length).toBe(2);
+      sm.clearCheckpoints();
+      expect(sm.listCheckpoints().length).toBe(0);
+    });
+  });
+
+  // ---- V1.2: 工作区管理 ----
+  describe('工作区管理', () => {
+    it('createWorkspace应创建新工作区', () => {
+      sm.createSession('ws-create');
+      const ws = sm.createWorkspace('frontend', '/project/frontend');
+      expect(ws).not.toBeNull();
+      expect(ws!.name).toBe('frontend');
+      expect(ws!.projectPath).toBe('/project/frontend');
+      expect(ws!.active).toBe(true);
+      expect(ws!.id).toBeDefined();
+    });
+
+    it('创建工作区应设为活跃', () => {
+      sm.createSession('ws-active');
+      const ws1 = sm.createWorkspace('ws1', '/path1');
+      const ws2 = sm.createWorkspace('ws2', '/path2');
+      // 新创建的ws2应为活跃，ws1应变为非活跃
+      expect(ws2!.active).toBe(true);
+      const active = sm.getActiveWorkspace();
+      expect(active!.id).toBe(ws2!.id);
+    });
+
+    it('无活跃会话时创建工作区应返回null', () => {
+      const ws = sm.createWorkspace('no-session', '/path');
+      expect(ws).toBeNull();
+    });
+
+    it('switchWorkspace应切换活跃工作区', () => {
+      sm.createSession('ws-switch');
+      const ws1 = sm.createWorkspace('ws1', '/path1');
+      const ws2 = sm.createWorkspace('ws2', '/path2');
+      // 当前活跃是ws2，切换到ws1
+      const switched = sm.switchWorkspace(ws1!.id);
+      expect(switched).not.toBeNull();
+      expect(switched!.name).toBe('ws1');
+      expect(switched!.active).toBe(true);
+      const active = sm.getActiveWorkspace();
+      expect(active!.id).toBe(ws1!.id);
+    });
+
+    it('切换不存在的工作区应返回null', () => {
+      sm.createSession('ws-switch-noexist');
+      sm.createWorkspace('ws1', '/path1');
+      const switched = sm.switchWorkspace('non-existent-id');
+      expect(switched).toBeNull();
+    });
+
+    it('getActiveWorkspace应返回当前活跃工作区', () => {
+      sm.createSession('ws-get-active');
+      sm.createWorkspace('active-ws', '/active/path');
+      const active = sm.getActiveWorkspace();
+      expect(active).not.toBeNull();
+      expect(active!.name).toBe('active-ws');
+    });
+
+    it('无工作区时getActiveWorkspace应返回null', () => {
+      sm.createSession('ws-no-active');
+      const active = sm.getActiveWorkspace();
+      expect(active).toBeNull();
+    });
+
+    it('listWorkspaces应列出所有工作区', () => {
+      sm.createSession('ws-list');
+      sm.createWorkspace('ws1', '/path1');
+      sm.createWorkspace('ws2', '/path2');
+      sm.createWorkspace('ws3', '/path3');
+      const list = sm.listWorkspaces();
+      expect(list.length).toBe(3);
+    });
+
+    it('deleteWorkspace应删除指定工作区', () => {
+      sm.createSession('ws-delete');
+      sm.createWorkspace('ws1', '/path1');
+      const ws2 = sm.createWorkspace('ws2', '/path2');
+      expect(sm.listWorkspaces().length).toBe(2);
+      const deleted = sm.deleteWorkspace(ws2!.id);
+      expect(deleted).toBe(true);
+      expect(sm.listWorkspaces().length).toBe(1);
+    });
+
+    it('删除活跃工作区应自动切换到第一个', () => {
+      sm.createSession('ws-delete-active');
+      const ws1 = sm.createWorkspace('ws1', '/path1');
+      const ws2 = sm.createWorkspace('ws2', '/path2');
+      // ws2是活跃的，删除ws2后ws1应变为活跃
+      sm.deleteWorkspace(ws2!.id);
+      const active = sm.getActiveWorkspace();
+      expect(active).not.toBeNull();
+      expect(active!.id).toBe(ws1!.id);
+      expect(active!.active).toBe(true);
+    });
+
+    it('删除所有工作区后activeWorkspaceId应为undefined', () => {
+      sm.createSession('ws-delete-all');
+      const ws = sm.createWorkspace('only-ws', '/path1');
+      sm.deleteWorkspace(ws!.id);
+      expect(sm.listWorkspaces().length).toBe(0);
+      expect(sm.getActiveWorkspace()).toBeNull();
+    });
+
+    it('getWorkspaceSummary应返回摘要信息', () => {
+      sm.createSession('ws-summary');
+      sm.createWorkspace('frontend', '/project/frontend');
+      sm.createWorkspace('backend', '/project/backend');
+      const summary = sm.getWorkspaceSummary();
+      expect(summary).toContain('frontend');
+      expect(summary).toContain('backend');
+      expect(summary).toContain('2');
+    });
+
+    it('无工作区时getWorkspaceSummary应提示无工作区', () => {
+      sm.createSession('ws-summary-empty');
+      const summary = sm.getWorkspaceSummary();
+      expect(summary).toContain('无工作区');
+    });
+  });
 });

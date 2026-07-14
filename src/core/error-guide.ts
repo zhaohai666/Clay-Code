@@ -67,6 +67,18 @@ const ERROR_GUIDES: Record<number, ErrorGuide> = {
     fixSuggestion: '请重新登录同步会话，或使用 clay session recover 恢复备份快照',
     fixCommand: 'clay session recover',
   },
+  [ErrorCode.PATCH_CONFLICT]: {
+    code: ErrorCode.PATCH_CONFLICT,
+    message: '多条补丁存在文件修改冲突，修改同一文件的代码行区间重叠',
+    fixSuggestion: '终止批量执行，请调整工具调用顺序或修改补丁行号范围',
+    fixCommand: 'clay log --level warn',
+  },
+  [ErrorCode.CHECKPOINT_CORRUPT]: {
+    code: ErrorCode.CHECKPOINT_CORRUPT,
+    message: '检查点数据损坏，无法恢复到该执行现场',
+    fixSuggestion: '将自动加载上一个有效快照继续运行，或使用 clay session checkpoint list 查看可用检查点',
+    fixCommand: 'clay session checkpoint list',
+  },
 };
 
 /**

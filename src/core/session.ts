@@ -253,6 +253,24 @@ export class SessionManager {
     const idx = session.checkpoints.findIndex((cp) => cp.id === checkpointId);
     if (idx === -1) {
       logger.warn(`[SessionManager] 检查点不存在: ${checkpointId}`);
+      // V1.2: 检查点数据损坏 - 尝试加载上一个有效快照
+      if (session.checkpoints.length > 0) {
+        const lastValid = session.checkpoints[session.checkpoints.length - 1];
+        logger.info(`[SessionManager] 检查点数据可能损坏(ErrorCode=${ErrorCode.CHECKPOINT_CORRUPT})，尝试恢复到最近有效检查点: ${lastValid.id.slice(0, 8)}`);
+        return this.restoreCheckpoint(lastValid.id);
+      }
+      return null;
+    }
+    // 校验检查点数据完整性
+    const checkpoint = session.checkpoints[idx];
+    if (!checkpoint.toolCalls || !checkpoint.executeResults || checkpoint.messageCount === undefined) {
+      logger.warn(`[SessionManager] 检查点数据损坏(ErrorCode=${ErrorCode.CHECKPOINT_CORRUPT}): ${checkpointId.slice(0, 8)}`);
+      // 尝试回退到前一个有效检查点
+      if (idx > 0) {
+        const prevCheckpoint = session.checkpoints[idx - 1];
+        logger.info(`[SessionManager] 回退到前一个有效检查点: ${prevCheckpoint.id.slice(0, 8)}`);
+        return this.restoreCheckpoint(prevCheckpoint.id);
+      }
       return null;
     }
     // 截断检查点列表至目标位置（丢弃目标之后的检查点）

@@ -58,6 +58,24 @@ describe('getErrorGuide', () => {
     expect(guide.message).toContain('解密');
   });
 
+  it('应返回PATCH_CONFLICT错误指引', () => {
+    const guide = getErrorGuide(ErrorCode.PATCH_CONFLICT);
+    expect(guide).toBeDefined();
+    expect(guide.code).toBe(ErrorCode.PATCH_CONFLICT);
+    expect(guide.message).toContain('冲突');
+    expect(guide.fixSuggestion).toContain('调整');
+    expect(guide.fixCommand).toContain('clay log');
+  });
+
+  it('应返回CHECKPOINT_CORRUPT错误指引', () => {
+    const guide = getErrorGuide(ErrorCode.CHECKPOINT_CORRUPT);
+    expect(guide).toBeDefined();
+    expect(guide.code).toBe(ErrorCode.CHECKPOINT_CORRUPT);
+    expect(guide.message).toContain('损坏');
+    expect(guide.fixSuggestion).toContain('快照');
+    expect(guide.fixCommand).toContain('checkpoint');
+  });
+
   it('未知错误码应返回fallback指引', () => {
     const guide = getErrorGuide(99999);
     expect(guide).toBeDefined();

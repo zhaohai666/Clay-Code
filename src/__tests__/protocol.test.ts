@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { ProtocolConverter } from '../core/protocol';
+import { ProtocolConverter, TaskPlanEngine } from '../core/protocol';
 import { DEFAULT_CONFIG, TaskRequest, ToolCall } from '../types';
 
 describe('ProtocolConverter', () => {
@@ -390,6 +390,276 @@ describe('ProtocolConverter', () => {
     it('空文件列表应返回空数组', () => {
       const chunks = converter.buildProjectContext([]);
       expect(chunks).toEqual([]);
+    });
+  });
+});
+
+// ---- TaskPlanEngine ----
+describe('TaskPlanEngine', () => {
+  let engine: TaskPlanEngine;
+
+  beforeEach(() => {
+    engine = new TaskPlanEngine();
+  });
+
+  // ---- shouldPlan ----
+  describe('shouldPlan', () => {
+    it('简单需求不应触发规划', () => {
+      expect(engine.shouldPlan('修复typo')).toBe(false);
+    });
+
+    it('单个复杂信号不应触发规划', () => {
+      expect(engine.shouldPlan('重构这个函数')).toBe(false);
+    });
+
+    it('两个以上复杂信号应触发规划', () => {
+      expect(engine.shouldPlan('重构并迁移数据库模块')).toBe(true);
+    });
+
+    it('超过200字的需求应触发规划', () => {
+      const longPrompt = '请帮我实现一个完整的用户管理系统'.repeat(15);
+      expect(engine.shouldPlan(longPrompt)).toBe(true);
+    });
+
+    it('包含多步骤信号应触发规划', () => {
+      expect(engine.shouldPlan('重构并迁移数据库模块')).toBe(true);
+    });
+  });
+
+  // ---- createPlan ----
+  describe('createPlan', () => {
+    it('应创建包含子任务的规划', () => {
+      const plan = engine.createPlan('重构认证模块', [
+        { title: '分析现有代码', description: '阅读现有认证逻辑' },
+        { title: '编写新实现' },
+      ]);
+      expect(plan.summary).toBe('重构认证模块');
+      expect(plan.subTasks.length).toBe(2);
+      expect(plan.status).toBe('pending');
+    });
+
+    it('应自动分配子任务ID', () => {
+      const plan = engine.createPlan('迁移数据库', [
+        { title: '备份数据' },
+        { title: '执行迁移' },
+        { title: '验证结果' },
+      ]);
+      expect(plan.subTasks[0].id).toBe('task-1');
+      expect(plan.subTasks[1].id).toBe('task-2');
+      expect(plan.subTasks[2].id).toBe('task-3');
+    });
+
+    it('子任务初始状态应为未完成', () => {
+      const plan = engine.createPlan('测试', [{ title: '步骤1' }]);
+      expect(plan.subTasks[0].finished).toBe(false);
+    });
+
+    it('应支持子任务依赖', () => {
+      const plan = engine.createPlan('测试', [
+        { title: '步骤1', depends: [] },
+        { title: '步骤2', depends: ['task-1'] },
+      ]);
+      expect(plan.subTasks[1].depends).toEqual(['task-1']);
+    });
+
+    it('应设为当前规划', () => {
+      engine.createPlan('当前规划', [{ title: '任务1' }]);
+      expect(engine.getCurrentPlan()).not.toBeNull();
+      expect(engine.getCurrentPlan()!.summary).toBe('当前规划');
+    });
+  });
+
+  // ---- extractPlanFromResponse ----
+  describe('extractPlanFromResponse', () => {
+    it('应从JSON代码块提取规划', () => {
+      const response = '```json\n{"summary":"重构","subTasks":[{"title":"步骤1"},{"title":"步骤2"}]}\n```';
+      const plan = engine.extractPlanFromResponse(response);
+      expect(plan).not.toBeNull();
+      expect(plan!.summary).toBe('重构');
+      expect(plan!.subTasks.length).toBe(2);
+    });
+
+    it('应从代码块提取规划（非tool字段JSON）', () => {
+      const response = '```json\n{"summary":"迁移","subTasks":[{"title":"分析"},{"title":"执行"}]}\n```';
+      const plan = engine.extractPlanFromResponse(response);
+      expect(plan).not.toBeNull();
+      expect(plan!.summary).toBe('迁移');
+      expect(plan!.subTasks.length).toBe(2);
+    });
+
+    it('无效响应应返回null', () => {
+      expect(engine.extractPlanFromResponse('这是普通文本')).toBeNull();
+    });
+
+    it('缺少subTasks应返回null', () => {
+      const response = '```json\n{"summary":"无子任务"}\n```';
+      expect(engine.extractPlanFromResponse(response)).toBeNull();
+    });
+
+    it('应标准化规划字段', () => {
+      const response = '```json\n{"summary":"测试","subTasks":[{"title":"步骤1"}]}\n```';
+      const plan = engine.extractPlanFromResponse(response);
+      expect(plan!.subTasks[0].id).toBe('task-1');
+      expect(plan!.subTasks[0].finished).toBe(false);
+      expect(plan!.status).toBe('pending');
+    });
+  });
+
+  // ---- getCurrentPlan ----
+  describe('getCurrentPlan', () => {
+    it('初始应返回null', () => {
+      expect(engine.getCurrentPlan()).toBeNull();
+    });
+
+    it('创建规划后应返回当前规划', () => {
+      engine.createPlan('当前', [{ title: '任务1' }]);
+      expect(engine.getCurrentPlan()).not.toBeNull();
+    });
+  });
+
+  // ---- updateSubTask ----
+  describe('updateSubTask', () => {
+    it('应更新子任务字段', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      const plan = engine.updateSubTask('task-1', { finished: true });
+      expect(plan).not.toBeNull();
+      expect(plan!.subTasks[0].finished).toBe(true);
+    });
+
+    it('所有子任务完成应标记规划为completed', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      const plan = engine.updateSubTask('task-1', { finished: true });
+      expect(plan!.status).toBe('completed');
+    });
+
+    it('不存在的taskId应返回null', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      expect(engine.updateSubTask('non-existent', { finished: true })).toBeNull();
+    });
+
+    it('无当前规划应返回null', () => {
+      expect(engine.updateSubTask('task-1', { finished: true })).toBeNull();
+    });
+  });
+
+  // ---- activatePlan / cancelPlan ----
+  describe('activatePlan / cancelPlan', () => {
+    it('activatePlan应将状态设为active', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      const plan = engine.activatePlan();
+      expect(plan).not.toBeNull();
+      expect(plan!.status).toBe('active');
+    });
+
+    it('cancelPlan应将状态设为cancelled', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      const plan = engine.cancelPlan();
+      expect(plan).not.toBeNull();
+      expect(plan!.status).toBe('cancelled');
+    });
+
+    it('无当前规划时activatePlan应返回null', () => {
+      expect(engine.activatePlan()).toBeNull();
+    });
+
+    it('无当前规划时cancelPlan应返回null', () => {
+      expect(engine.cancelPlan()).toBeNull();
+    });
+  });
+
+  // ---- getNextTask ----
+  describe('getNextTask', () => {
+    it('active状态下应返回第一个未完成任务', () => {
+      engine.createPlan('测试', [
+        { title: '步骤1' },
+        { title: '步骤2' },
+      ]);
+      engine.activatePlan();
+      const next = engine.getNextTask();
+      expect(next).not.toBeNull();
+      expect(next!.title).toBe('步骤1');
+    });
+
+    it('应跳过已完成的任务', () => {
+      engine.createPlan('测试', [
+        { title: '步骤1' },
+        { title: '步骤2' },
+      ]);
+      engine.activatePlan();
+      engine.updateSubTask('task-1', { finished: true });
+      const next = engine.getNextTask();
+      expect(next!.title).toBe('步骤2');
+    });
+
+    it('应尊重依赖关系', () => {
+      engine.createPlan('测试', [
+        { title: '步骤1' },
+        { title: '步骤2', depends: ['task-1'] },
+      ]);
+      engine.activatePlan();
+      // 步骤2依赖步骤1，步骤1未完成，getNextTask应返回步骤1
+      const next = engine.getNextTask();
+      expect(next!.title).toBe('步骤1');
+    });
+
+    it('依赖满足后应返回依赖任务', () => {
+      engine.createPlan('测试', [
+        { title: '步骤1' },
+        { title: '步骤2', depends: ['task-1'] },
+      ]);
+      engine.activatePlan();
+      engine.updateSubTask('task-1', { finished: true });
+      const next = engine.getNextTask();
+      expect(next!.title).toBe('步骤2');
+    });
+
+    it('非active状态应返回null', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      // 状态为pending，不是active
+      expect(engine.getNextTask()).toBeNull();
+    });
+
+    it('所有任务完成应返回null', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      engine.activatePlan();
+      engine.updateSubTask('task-1', { finished: true });
+      expect(engine.getNextTask()).toBeNull();
+    });
+  });
+
+  // ---- generatePlanSummary ----
+  describe('generatePlanSummary', () => {
+    it('应生成包含摘要和状态的文本', () => {
+      engine.createPlan('重构认证模块', [
+        { title: '分析代码' },
+        { title: '编写新实现' },
+      ]);
+      const summary = engine.generatePlanSummary();
+      expect(summary).toContain('重构认证模块');
+      expect(summary).toContain('pending');
+      expect(summary).toContain('分析代码');
+      expect(summary).toContain('编写新实现');
+    });
+
+    it('已完成任务应显示完成标记', () => {
+      engine.createPlan('测试', [{ title: '步骤1' }]);
+      engine.updateSubTask('task-1', { finished: true });
+      const summary = engine.generatePlanSummary();
+      expect(summary).toContain('✅');
+    });
+
+    it('应显示依赖关系', () => {
+      engine.createPlan('测试', [
+        { title: '步骤1' },
+        { title: '步骤2', depends: ['task-1'] },
+      ]);
+      const summary = engine.generatePlanSummary();
+      expect(summary).toContain('依赖');
+      expect(summary).toContain('task-1');
+    });
+
+    it('无规划时应返回空字符串', () => {
+      expect(engine.generatePlanSummary()).toBe('');
     });
   });
 });
