@@ -136,6 +136,10 @@ export class BaseAdapter implements WebAIAdapter {
   /** 检查是否已登录 */
   async isLoggedIn(): Promise<boolean> {
     try {
+      // 先恢复已保存的Cookie，复用登录态
+      if (this.bridge.hasCookieCache()) {
+        await this.bridge.loadCookies();
+      }
       const page = await this.bridge.navigateTo(this.url);
       // 检查是否存在输入框（已登录状态）
       try {

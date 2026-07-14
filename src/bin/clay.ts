@@ -99,7 +99,7 @@ program
         ? sessionManager.getSession(opts.session)
         : sessionManager.createSession();
 
-      console.log('\n💬 ClayCode 对话模式 (会话: ${session.sessionId})');
+      console.log(`\n💬 ClayCode 对话模式 (会话: ${session.sessionId})`);
       console.log('输入消息开始对话，输入 .quit 退出，输入 .clear 清空会话\n');
 
       // 初始化命令历史持久化
@@ -180,6 +180,23 @@ program
   .option('-a, --adapter <name>', 'AI适配器名称', 'doubao')
   .action(async (opts: { adapter: string }) => {
     const engine = new ClayCodeEngine();
+
+    // 先注册SIGINT处理（在login之前，确保任何时候Ctrl+C都能保存状态）
+    let isShuttingDown = false;
+    const onSigInt = async () => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      console.log('\n💾 正在保存登录状态...');
+      try {
+        await engine.saveLoginState();
+        console.log('✅ 登录状态已保存');
+      } catch {
+        console.warn('⚠️ Cookie保存失败，但浏览器登录态可能已保留');
+      }
+      await engine.dispose();
+      process.exit(0);
+    };
+    process.on('SIGINT', onSigInt);
 
     try {
       console.log(`\n🔐 正在打开 ${opts.adapter} 登录页面...`);

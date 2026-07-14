@@ -180,6 +180,12 @@ export class ClayCodeEngine {
     await this.browserBridge.launch();
     logger.info('[ClayCodeEngine] 浏览器已启动');
 
+    // 恢复已保存的Cookie（复用登录态）
+    if (this.browserBridge.hasCookieCache()) {
+      await this.browserBridge.loadCookies();
+      logger.info('[ClayCodeEngine] 已恢复登录态');
+    }
+
     // 加载并初始化插件
     await this.pluginManager.loadAll();
     await this.pluginManager.setupAll();
@@ -729,14 +735,32 @@ export class ClayCodeEngine {
   }
 
   /**
+   * 保存登录状态（Cookie加密持久化）
+   * 供clay login命令在用户完成登录后调用
+   */
+  async saveLoginState(): Promise<void> {
+    try {
+      await this.browserBridge.saveCookies();
+    } catch (err) {
+      logger.warn(`[ClayCodeEngine] 保存登录状态失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
    * 关闭引擎，释放资源
    */
   async dispose(): Promise<void> {
     logger.info('[ClayCodeEngine] 关闭引擎...');
-    await this.pluginManager.destroyAll();
-    await this.browserBridge.close();
+    try {
+      await this.pluginManager.destroyAll();
+    } catch { /* 忽略 */ }
+    try {
+      await this.browserBridge.close();
+    } catch { /* 忽略 */ }
     this.cache.destroy();
-    await this.metrics.destroy();
+    try {
+      await this.metrics.destroy();
+    } catch { /* 忽略 */ }
     logger.close();
   }
 
