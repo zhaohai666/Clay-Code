@@ -28,9 +28,9 @@ const ADAPTER_CONFIGS: Record<WebAdapterType, AdapterConfig> = {
     name: 'doubao',
     displayName: '豆包',
     url: 'https://www.doubao.com/chat/',
-    inputSelector: 'textarea[data-testid="chat_input"]',
-    sendButtonSelector: 'button[data-testid="send_button"]',
-    responseSelector: '.message-content:last-child',
+    inputSelector: 'textarea.semi-input-textarea',
+    sendButtonSelector: '',  // 豆包使用Enter键发送，无需按钮选择器
+    responseSelector: '[class*="md-box-root"]',
     loginUrl: 'https://www.doubao.com/',
   },
   'chatgpt-web': {
@@ -68,6 +68,15 @@ const ADAPTER_CONFIGS: Record<WebAdapterType, AdapterConfig> = {
     sendButtonSelector: 'button[class*="send"]',
     responseSelector: '.markdown-body:last-child',
     loginUrl: 'https://tongyi.aliyun.com/qianwen/',
+  },
+  deepseek: {
+    name: 'deepseek',
+    displayName: 'DeepSeek',
+    url: 'https://chat.deepseek.com/',
+    inputSelector: 'textarea',
+    sendButtonSelector: '',  // DeepSeek使用Enter键发送
+    responseSelector: '.markdown-body',
+    loginUrl: 'https://chat.deepseek.com/',
   },
 };
 

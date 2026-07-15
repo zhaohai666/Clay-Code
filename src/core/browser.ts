@@ -27,6 +27,10 @@ export class BrowserBridge {
     restartCount: 0,
   };
   private security: SecurityManager;
+  /** 是否正在主动关闭浏览器（防止disconnected事件误触发重启） */
+  private isClosing = false;
+  /** Cookie自动保存定时器 */
+  private cookieAutoSaveTimer?: ReturnType<typeof setInterval>;
 
   constructor(config: GlobalConfig) {
     this.config = config;
@@ -46,6 +50,7 @@ export class BrowserBridge {
     }
 
     this.info.status = 'launching';
+    this.isClosing = false;
     logger.info('[BrowserBridge] 正在启动浏览器实例...');
 
     try {
@@ -64,11 +69,15 @@ export class BrowserBridge {
       logger.info(`[BrowserBridge] Chrome路径: ${chromePath}`);
 
       // 4. 启动Puppeteer
+      // 禁止Puppeteer拦截SIGINT，由CLI层统一处理优雅退出（保存Cookie等）
       const launchOptions: Record<string, any> = {
         executablePath: chromePath,
         headless: this.config.browserHeadless ? true : false,
         userDataDir: dataDir,
         defaultViewport: { width: 1280, height: 800 },
+        handleSIGINT: false,
+        handleSIGHUP: false,
+        handleSIGTERM: false,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -83,8 +92,12 @@ export class BrowserBridge {
       const puppeteer = await import('puppeteer-core');
       this.browser = await puppeteer.default.launch(launchOptions);
 
-      // 5. 监听断开事件
+      // 5. 监听断开事件（仅非主动关闭时触发重启）
       this.browser.on('disconnected', () => {
+        if (this.isClosing) {
+          logger.info('[BrowserBridge] 浏览器已主动关闭，跳过重启');
+          return;
+        }
         logger.warn('[BrowserBridge] 浏览器连接断开');
         this.info.status = 'crashed';
         this.attemptRestart();
@@ -138,9 +151,13 @@ export class BrowserBridge {
       await page.type(inputSelector, text, { delay: 50 });
     }
 
-    // 点击发送按钮
-    await page.waitForSelector(sendButtonSelector, { timeout: 5000 });
-    await page.click(sendButtonSelector);
+    // 发送消息：有发送按钮选择器则点击按钮，否则用Enter键发送
+    if (sendButtonSelector) {
+      await page.waitForSelector(sendButtonSelector, { timeout: 5000 });
+      await page.click(sendButtonSelector);
+    } else {
+      await page.keyboard.press('Enter');
+    }
   }
 
   /** 等待AI回复并提取文本 */
@@ -149,8 +166,35 @@ export class BrowserBridge {
     const waitTime = timeout ?? this.config.requestTimeout;
 
     try {
-      // 等待回复容器出现
-      await page.waitForSelector(responseSelector, { timeout: waitTime });
+      // 记录发送前的匹配元素数量，用于检测新增的AI回复
+      const countBefore = await page.$$eval(responseSelector, (els: any[]) => els.length);
+      logger.debug(`[BrowserBridge] 等待AI回复，发送前匹配元素数: ${countBefore}`);
+
+      // 等待新增回复元素出现（元素数量增加）
+      const waitForNewElement = async (maxWait: number): Promise<boolean> => {
+        const startTime = Date.now();
+        while (Date.now() - startTime < maxWait) {
+          const currentCount = await page.$$eval(responseSelector, (els: any[]) => els.length);
+          if (currentCount > countBefore) {
+            logger.debug(`[BrowserBridge] 检测到新回复元素，当前数: ${currentCount}`);
+            return true;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        return false;
+      };
+
+      // 先等待新元素出现（最多等待超时时间的一半）
+      const newElementAppeared = await waitForNewElement(Math.floor(waitTime / 2));
+      if (!newElementAppeared) {
+        // 如果没有新增元素，也尝试用原有选择器等待（兼容只更新内容的场景）
+        logger.debug('[BrowserBridge] 未检测到新增元素，尝试等待现有元素内容更新');
+        try {
+          await page.waitForSelector(responseSelector, { timeout: Math.floor(waitTime / 2) });
+        } catch {
+          throw new Error(`等待回复元素超时 (${waitTime}ms)`);
+        }
+      }
 
       // 等待回复完成（内容不再变化）
       let lastText = '';
@@ -159,7 +203,12 @@ export class BrowserBridge {
 
       for (let i = 0; i < 60; i++) {
         await new Promise((r) => setTimeout(r, 1000));
-        const currentText = await page.$eval(responseSelector, (el: any) => el.textContent || '');
+        // 取最后一个匹配元素的文本（AI回复在用户消息之后）
+        const currentText = await page.$$eval(responseSelector, (els: any[]) => {
+          if (els.length === 0) return '';
+          const lastEl = els[els.length - 1];
+          return lastEl.textContent || '';
+        });
         const cleaned = cleanStreamOutput(currentText);
 
         if (cleaned === lastText && cleaned.length > 0) {
@@ -171,8 +220,12 @@ export class BrowserBridge {
         }
       }
 
-      // 提取最终回复
-      const finalText = await page.$eval(responseSelector, (el: any) => el.textContent || '');
+      // 提取最终回复（取最后一个匹配元素）
+      const finalText = await page.$$eval(responseSelector, (els: any[]) => {
+        if (els.length === 0) return '';
+        const lastEl = els[els.length - 1];
+        return lastEl.textContent || '';
+      });
       const cleanedResponse = cleanStreamOutput(finalText);
 
       // 检测人机验证
@@ -191,6 +244,8 @@ export class BrowserBridge {
 
   /** 关闭浏览器 */
   async close(): Promise<void> {
+    this.isClosing = true;
+    this.stopCookieAutoSave();
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
@@ -336,6 +391,33 @@ export class BrowserBridge {
       logger.info(`[BrowserBridge] 已加载 ${cookies.length} 个Cookie`);
     } catch (err) {
       logger.warn(`[BrowserBridge] Cookie加载失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * 启动Cookie自动保存定时器
+   * 在clay login期间定期保存Cookie，避免Ctrl+C时Chrome已关闭导致保存失败
+   */
+  startCookieAutoSave(intervalMs: number = 10000): void {
+    this.stopCookieAutoSave();
+    this.cookieAutoSaveTimer = setInterval(async () => {
+      try {
+        if (this.page && !this.page.isClosed() && this.browser?.connected) {
+          await this.saveCookies();
+        }
+      } catch {
+        // 忽略自动保存错误
+      }
+    }, intervalMs);
+    logger.info(`[BrowserBridge] Cookie自动保存已启动(间隔${intervalMs}ms)`);
+  }
+
+  /** 停止Cookie自动保存定时器 */
+  stopCookieAutoSave(): void {
+    if (this.cookieAutoSaveTimer) {
+      clearInterval(this.cookieAutoSaveTimer);
+      this.cookieAutoSaveTimer = undefined;
+      logger.info('[BrowserBridge] Cookie自动保存已停止');
     }
   }
 

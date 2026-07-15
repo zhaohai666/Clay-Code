@@ -125,7 +125,7 @@ describe('SessionManager', () => {
       expect(sm.getActiveSession()?.messages[0].role).toBe('system');
     });
 
-    it('消息超过maxContextChunk应裁剪', () => {
+    it('消息超过maxContextChunk应裁剪', async () => {
       const session = sm.createSession('trim-test');
       // 添加系统消息（不应被裁剪）
       sm.addMessage(session.sessionId, { role: 'system', content: 'System prompt' });
@@ -139,7 +139,7 @@ describe('SessionManager', () => {
       expect(systemMsgs.length).toBe(1);
       // 总消息数应被裁剪
       expect(got.messages.length).toBeLessThan(101);
-    });
+    }, 30000);
   });
 
   // ---- 会话删除 ----

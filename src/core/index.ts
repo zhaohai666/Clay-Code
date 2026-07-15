@@ -62,10 +62,16 @@ export class ClayCodeEngine {
     configPath?: string;
     cwd?: string;
     maxRounds?: number;
+    /** 强制浏览器无头模式（覆盖配置文件中的browserHeadless） */
+    browserHeadless?: boolean;
   }) {
     // 1. 加载配置
     this.configManager = new ConfigManager(options?.configPath);
     this.config = this.configManager.getConfig();
+    // 覆盖浏览器无头模式（chat/agent命令需要headless，login命令需要可见）
+    if (options?.browserHeadless !== undefined) {
+      this.config.browserHeadless = options.browserHeadless;
+    }
 
     this.cwd = options?.cwd || process.cwd();
 
@@ -228,15 +234,12 @@ export class ClayCodeEngine {
       return this.protocol.buildErrorResponse(ErrorCode.ADAPTER_NOT_FOUND, errMsg);
     }
 
-    // 检查登录状态
-    const isLoggedIn = await adapter.isLoggedIn();
-    if (!isLoggedIn) {
-      const loginUrl = adapter.getLoginUrl();
-      return this.protocol.buildErrorResponse(
-        ErrorCode.HUMAN_VERIFICATION,
-        `未登录，请先执行 clay login 打开浏览器登录: ${loginUrl}`
-      );
-    }
+    // 尝试恢复登录态（可选，不阻塞请求）
+    try {
+      if (this.browserBridge.hasCookieCache()) {
+        await this.browserBridge.loadCookies();
+      }
+    } catch { /* 忽略Cookie加载失败，继续请求 */ }
 
     // 插件钩子：beforeAiRequest
     await this.pluginManager.beforeAiRequest({
@@ -450,15 +453,13 @@ export class ClayCodeEngine {
 
     const streamAdapter = adapter as OllamaAdapter;
 
-    // 初始化：检查登录状态
-    const isLoggedIn = await adapter.isLoggedIn();
-    if (!isLoggedIn) {
-      const loginUrl = adapter.getLoginUrl();
-      return this.protocol.buildErrorResponse(
-        ErrorCode.HUMAN_VERIFICATION,
-        `未登录，请先执行 clay login 打开浏览器登录: ${loginUrl}`,
-      );
-    }
+    // 尝试恢复登录态（可选，不阻塞请求）
+    try {
+      if (this.browserBridge.hasCookieCache()) {
+        await this.browserBridge.loadCookies();
+      }
+    } catch { /* 忽略Cookie加载失败，继续请求 */ }
+
     this.changedFiles.clear();
     this.tempVars.clear();
 
@@ -747,10 +748,34 @@ export class ClayCodeEngine {
   }
 
   /**
+   * 启动Cookie自动保存（clay login期间使用）
+   * 定期保存Cookie避免Ctrl+C时Chrome已关闭导致保存失败
+   */
+  startCookieAutoSave(intervalMs?: number): void {
+    this.browserBridge.startCookieAutoSave(intervalMs);
+  }
+
+  /** 停止Cookie自动保存 */
+  stopCookieAutoSave(): void {
+    this.browserBridge.stopCookieAutoSave();
+  }
+
+  /** 检查是否有Cookie缓存文件 */
+  hasCookieCache(): boolean {
+    return this.browserBridge.hasCookieCache();
+  }
+
+  /**
    * 关闭引擎，释放资源
+   * 退出前自动保存Cookie，确保登录态持久化
    */
   async dispose(): Promise<void> {
     logger.info('[ClayCodeEngine] 关闭引擎...');
+    // 先保存Cookie（浏览器关闭前才能获取）
+    try {
+      await this.browserBridge.saveCookies();
+      logger.info('[ClayCodeEngine] 登录状态已保存');
+    } catch { /* 忽略 */ }
     try {
       await this.pluginManager.destroyAll();
     } catch { /* 忽略 */ }

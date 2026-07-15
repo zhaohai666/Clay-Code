@@ -9,7 +9,7 @@
 // ============================================================
 
 /** 支持的网页AI适配器类型 */
-export type AdapterType = 'doubao' | 'chatgpt-web' | 'claude-web' | 'ollama' | 'kimi' | 'qwen';
+export type AdapterType = 'doubao' | 'chatgpt-web' | 'claude-web' | 'ollama' | 'kimi' | 'qwen' | 'deepseek';
 
 /** 缓存级别 */
 export type CacheLevel = 'l1' | 'l2' | 'l1+l2' | 'none';

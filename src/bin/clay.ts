@@ -43,7 +43,19 @@ program
     const engine = new ClayCodeEngine({
       cwd: opts.cwd,
       maxRounds: parseInt(opts.rounds, 10),
+      browserHeadless: true,
     });
+
+    // 注册SIGINT处理，确保Ctrl+C时保存Cookie并优雅退出
+    let agentShuttingDown = false;
+    const onAgentSigInt = async () => {
+      if (agentShuttingDown) { process.exit(130); }
+      agentShuttingDown = true;
+      console.log('\n🛑 正在停止Agent...');
+      try { await engine.dispose(); } catch { /* 忽略 */ }
+      process.exit(0);
+    };
+    process.on('SIGINT', onAgentSigInt);
 
     try {
       await engine.init();
@@ -73,6 +85,7 @@ program
       console.error(`\n❌ 错误: ${message}`);
       process.exit(1);
     } finally {
+      process.removeListener('SIGINT', onAgentSigInt);
       await engine.dispose();
     }
   });
@@ -85,7 +98,8 @@ program
   .option('-s, --session <id>', '会话ID（继续已有会话）')
   .option('--cwd <path>', '工作目录', process.cwd())
   .action(async (opts: { adapter: string; session?: string; cwd: string }) => {
-    const engine = new ClayCodeEngine({ cwd: opts.cwd });
+    // chat/agent模式使用headless浏览器（用户无需看到浏览器窗口）
+    const engine = new ClayCodeEngine({ cwd: opts.cwd, browserHeadless: true });
 
     try {
       await engine.init();
@@ -179,21 +193,34 @@ program
   .description('打开浏览器登录AI平台')
   .option('-a, --adapter <name>', 'AI适配器名称', 'doubao')
   .action(async (opts: { adapter: string }) => {
-    const engine = new ClayCodeEngine();
+    // login模式使用可见浏览器（用户需要看到浏览器进行登录操作）
+    const engine = new ClayCodeEngine({ browserHeadless: false });
 
     // 先注册SIGINT处理（在login之前，确保任何时候Ctrl+C都能保存状态）
+    // 注意：BrowserBridge已设置handleSIGINT:false，Puppeteer不会拦截信号
     let isShuttingDown = false;
+    let cookieSaved = false;
     const onSigInt = async () => {
-      if (isShuttingDown) return;
+      if (isShuttingDown) {
+        // 第二次Ctrl+C，强制退出
+        process.exit(130);
+      }
       isShuttingDown = true;
       console.log('\n💾 正在保存登录状态...');
       try {
         await engine.saveLoginState();
+        cookieSaved = true;
         console.log('✅ 登录状态已保存');
       } catch {
-        console.warn('⚠️ Cookie保存失败，但浏览器登录态可能已保留');
+        // Ctrl+C时Chrome可能已关闭，Cookie可能已通过自动保存机制保存
+        if (engine.hasCookieCache()) {
+          cookieSaved = true;
+          console.log('✅ 登录状态已保存（通过自动保存）');
+        } else {
+          console.warn('⚠️ Cookie保存失败，但浏览器登录态可能已保留');
+        }
       }
-      await engine.dispose();
+      try { await engine.dispose(); } catch { /* 忽略 */ }
       process.exit(0);
     };
     process.on('SIGINT', onSigInt);
@@ -203,6 +230,9 @@ program
       const url = await engine.login(opts.adapter);
       console.log(`浏览器已打开: ${url}`);
       console.log('请在浏览器中完成登录，登录完成后按 Ctrl+C 退出\n');
+
+      // 启动Cookie自动保存（每10秒），避免Ctrl+C时Chrome已关闭导致保存失败
+      engine.startCookieAutoSave(10000);
 
       // 等待用户手动关闭
       await new Promise<void>(() => {});
@@ -1222,7 +1252,7 @@ _clay_completion() {
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
   
   commands="agent chat login config session log doctor deps plugin metrics market web report completion"
-  adapters="doubao chatgpt-web claude-web ollama kimi qwen"
+  adapters="doubao chatgpt-web claude-web ollama kimi qwen deepseek"
   config_keys="defaultAdapter dataDir browserDataPath chromePath sessionDir maxContextChunk maxHistoryMessages requestTimeout responseTimeout autoSyncExecuteLog browserHeadless execWhiteList enableSandbox cacheLevel maxBatchFiles browserIdleTimeout maxRetryCount ollamaEndpoint enableDockerSandbox metricsPort apiKey proxyUrl"
   session_actions="new use recover list delete"
   
@@ -1308,7 +1338,7 @@ _clay() {
     'completion:生成Shell自动补全脚本'
   )
   
-  adapters=('doubao:豆包' 'chatgpt-web:ChatGPT网页版' 'claude-web:Claude网页版' 'ollama:Ollama本地模型' 'kimi:Kimi' 'qwen:通义千问')
+  adapters=('doubao:豆包' 'chatgpt-web:ChatGPT网页版' 'claude-web:Claude网页版' 'ollama:Ollama本地模型' 'kimi:Kimi' 'qwen:通义千问' 'deepseek:DeepSeek')
   
   config_keys=(
     'defaultAdapter:默认AI适配器'
