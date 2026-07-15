@@ -143,12 +143,40 @@ export class BrowserBridge {
 
     // 等待输入框可用
     await page.waitForSelector(inputSelector, { timeout: 10000 });
-    // 清空并输入
+
+    // 清空输入框
     const inputEl = await page.$(inputSelector);
     if (inputEl) {
       await inputEl.click({ clickCount: 3 }); // 全选
       await page.keyboard.press('Backspace');
-      await page.type(inputSelector, text, { delay: 50 });
+    }
+
+    // 快速输入：使用剪贴板粘贴代替逐字符输入
+    // 长文本（如含项目上下文的prompt）逐字符输入耗时过长
+    try {
+      // page.evaluate内的代码运行在浏览器环境，使用字符串形式避免TS类型检查
+      await page.evaluate(`
+        (function() {
+          var el = document.querySelector('${inputSelector.replace(/'/g, "\\'")}');
+          if (el) {
+            var nativeSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype, 'value'
+            ) || Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            );
+            if (nativeSetter && nativeSetter.set) {
+              nativeSetter.set.call(el, ${JSON.stringify(text)});
+            } else {
+              el.value = ${JSON.stringify(text)};
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        })()
+      `);
+    } catch {
+      // 降级：逐字符输入（短文本或evaluate失败时）
+      await page.type(inputSelector, text, { delay: 10 });
     }
 
     // 发送消息：有发送按钮选择器则点击按钮，否则用Enter键发送
@@ -193,6 +221,18 @@ export class BrowserBridge {
           await page.waitForSelector(responseSelector, { timeout: Math.floor(waitTime / 2) });
         } catch {
           throw new Error(`等待回复元素超时 (${waitTime}ms)`);
+        }
+      }
+
+      // 检测到首个新元素后，等待短暂时间看是否有更多元素出现
+      // 场景：用户消息和AI回复使用同一选择器时，用户消息先出现（countBefore+1），
+      // AI回复随后出现（countBefore+2），需要取最后一个才是AI回复
+      if (newElementAppeared) {
+        const countAtFirstDetection = await page.$$eval(responseSelector, (els: any[]) => els.length);
+        await new Promise((r) => setTimeout(r, 3000)); // 等待3秒让AI回复元素也出现
+        const countAfterWait = await page.$$eval(responseSelector, (els: any[]) => els.length);
+        if (countAfterWait > countAtFirstDetection) {
+          logger.debug(`[BrowserBridge] 等待后检测到更多元素: ${countAtFirstDetection} → ${countAfterWait}`);
         }
       }
 
